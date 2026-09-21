@@ -513,3 +513,53 @@ test("V2 cleanup disposes registrations, clears timers, and stops the event cons
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getLoop(created.created))?.status).toBe("active")
 })
+
+test("V2 create_loop advertises keep_alive without making it required", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+
+  const input = loopTool(mock, "create_loop").input as {
+    properties: Record<string, { type?: string }>
+    required: string[]
+  }
+  expect(input.properties.keep_alive?.type).toBe("boolean")
+  expect(input.required).toEqual(["instruction"])
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 keep-alive loop survives age expiry and keeps its future open", async () => {
+  const mock = makeMockContext({ max_loop_age_days: 7 })
+  const cleanup = await plugin.setup(mock as never)
+
+  const created = JSON.parse(
+    contentOf(
+      await loopTool(mock, "create_loop").execute(
+        { instruction: "hold the future open", interval: "1s", keep_alive: true },
+        toolContext("ses_keep"),
+      ),
+    ),
+  ) as { created: string; loop: { keepAlive: boolean } }
+  expect(created.loop.keepAlive).toBe(true)
+
+  await waitFor(() => mock.promptCalls.length >= 1)
+  expect(mock.promptCalls[0]?.sessionID).toBe("ses_keep")
+  expect((await getLoop(created.created))?.status).toBe("active")
+
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 keep_alive requires a fixed interval", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+
+  await expect(
+    loopTool(mock, "create_loop").execute({ instruction: "no cadence", keep_alive: true }, toolContext("ses_bad")),
+  ).rejects.toThrow(/keep-alive loops require a fixed interval/)
+
+  mock.stream.end()
+  await cleanup()
+})

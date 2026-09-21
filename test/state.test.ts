@@ -194,6 +194,8 @@ test("decodes persisted state with optional fields omitted", async () => {
   expect(loop?.lastResult).toBeNull()
   expect(loop?.maxRuns).toBeNull()
   expect(loop?.agent).toBeNull()
+  // Loops persisted before keep-alive existed are ordinary loops.
+  expect(loop?.keepAlive).toBe(false)
 })
 
 test("writes state with owner-only file permissions", async () => {
@@ -215,4 +217,18 @@ test("formats loop lists for reports", async () => {
   expect(report).toContain(created.id)
   expect(report).toContain("every 10m")
   expect(report).toContain("check the deploy")
+})
+
+test("createLoop records keep-alive futures and defaults them off", async () => {
+  const ordinary = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
+  expect(ordinary.keepAlive).toBe(false)
+
+  const durable = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000, keepAlive: true })
+  expect(durable.keepAlive).toBe(true)
+})
+
+test("keep-alive loops cannot delegate pacing to the agent", async () => {
+  await expect(createLoop("ses_1", { prompt: "tick", mode: "dynamic", keepAlive: true })).rejects.toThrow(
+    /keep-alive loops require a fixed interval/,
+  )
 })

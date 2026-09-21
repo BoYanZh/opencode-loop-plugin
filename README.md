@@ -13,6 +13,7 @@ The OpenCode Loop Plugin adds:
 - `/loop <interval> <instruction>` and `/loop <instruction>` (dynamic pacing) as an OpenCode command for TUI, desktop, and web.
 - A server-side scheduler with per-loop timers that injects a synthetic iteration prompt only when the session is idle, with busy backoff.
 - Dynamic loops where the agent itself picks the delay before each next iteration via `schedule_next_run`, mirroring Claude Code's self-paced `/loop`.
+- Keep-alive loops: `create_loop({ keep_alive: true })` holds a background or subagent session running across turns until the agent stops it, so work that outlives the turn that started it is never ended by the scheduler.
 - Agent tools: `create_loop`, `list_loops`, `stop_loop`, `pause_loop`, `resume_loop`, `run_loop`, `schedule_next_run`, and `clear_loops`.
 - Persistent loop state that survives OpenCode restarts, with atomic writes and owner-only file permissions.
 - A TUI sidebar with live countdowns and a `Loops` command-palette entry to run, pause, resume, or stop loops.
@@ -119,6 +120,24 @@ After creating a loop, the agent immediately performs the first iteration in the
 ### Dynamic loops
 
 A dynamic loop mirrors Claude Code's self-paced `/loop`: at the end of each iteration the agent calls `schedule_next_run` with a delay in seconds and a one-sentence reason ("watching CI run"), or calls `stop_loop` to end the loop. If an iteration ends without doing either, the loop ends — exactly like omitting `ScheduleWakeup` in Claude Code.
+
+### Keeping a background session alive
+
+A subagent's session normally has no future of its own: the turn that spawned it ends, the parent detaches, and nothing re-enters that session again. `keep_alive` gives it one.
+
+```
+create_loop(
+  instruction: "Check whether the migration finished. If it has, report the result and call stop_loop.",
+  interval: "5m",
+  keep_alive: true
+)
+```
+
+The session keeps being re-prompted on the cadence until the agent calls `stop_loop` — because the work is resolved, or because it is giving up. The scheduler never ends a keep-alive loop on its own: it is exempt from the age expiry that stops ordinary loops, it survives an OpenCode restart, and it keeps retrying in a detached session this process never observed instead of quietly stalling.
+
+`keep_alive` requires a fixed interval. Dynamic pacing hands the next run to the agent every turn, so a single missed `schedule_next_run` would end the very future the flag exists to hold open; that combination is rejected when the loop is created.
+
+Handing a result back to whoever asked for the work stays the agent's job. This flag only keeps the session running long enough to do it.
 
 ### How iterations are scheduled
 

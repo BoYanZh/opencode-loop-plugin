@@ -27,6 +27,7 @@ var LoopSchema = Schema.Struct({
   sessionID: Schema.String,
   prompt: Schema.String,
   mode: Schema.optionalWith(Schema.Literal("interval", "dynamic"), { default: () => "interval" }),
+  keepAlive: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   intervalMs: NullableNumber,
   status: Schema.Literal("active", "paused", "stopped", "completed"),
   createdAt: Schema.Number,
@@ -217,6 +218,9 @@ function requireLoop(state, loopID) {
 async function createLoop(sessionID, options) {
   const prompt = validatePrompt(options.prompt);
   const mode = options.mode === "dynamic" ? "dynamic" : "interval";
+  const keepAlive = options.keepAlive === true;
+  if (keepAlive && mode !== "interval")
+    throw new Error("keep-alive loops require a fixed interval");
   const intervalMs = mode === "interval" ? positiveIntegerOrNull(options.intervalMs) : null;
   if (mode === "interval" && intervalMs == null)
     throw new Error("interval loops require a positive interval");
@@ -224,7 +228,7 @@ async function createLoop(sessionID, options) {
   const maxLoops = positiveIntegerOrNull(options.maxLoopsPerSession) ?? DEFAULT_MAX_LOOPS_PER_SESSION;
   const agent = typeof options.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   return mutate((state) => {
-    const open = Object.values(state.loops).filter((loop2) => loop2.sessionID === sessionID && isOpen(loop2.status));
+    const open = Object.values(state.loops).filter((loop) => loop.sessionID === sessionID && isOpen(loop.status));
     if (open.length >= maxLoops) {
       throw new Error(`this session already has ${open.length} open loop(s); stop one before creating another (limit ${maxLoops})`);
     }
@@ -237,6 +241,7 @@ async function createLoop(sessionID, options) {
       sessionID,
       prompt,
       mode,
+      keepAlive,
       intervalMs,
       status: "active",
       createdAt: timestamp,
@@ -510,6 +515,7 @@ Preserve each loop's id, cadence, instruction, and status in the compacted conte
 }
 
 // src/server.ts
+var KEEP_ALIVE_DESCRIPTION = "Keep this session alive across turns until the agent explicitly stops the loop. Requires a fixed interval. Use it in a background or subagent session whose work outlives the turn that started it: the scheduler keeps re-prompting the session on the cadence, and the loop is never ended automatically by age expiry. You remain responsible for calling stop_loop once the work is resolved or abandoned.";
 var DEFAULT_COMMAND_NAME = "loop";
 var DEFAULT_BUSY_BACKOFF_SECONDS = 60;
 var DEFAULT_FAILURE_BACKOFF_SECONDS = 60;
@@ -642,7 +648,7 @@ var server = async ({ client }, options) => {
       return;
     }
     loop = claimed;
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
@@ -669,7 +675,7 @@ var server = async ({ client }, options) => {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
-      if (!observedSessions.has(loop.sessionID)) {
+      if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
         await log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID });
         return;
       }
@@ -687,9 +693,9 @@ var server = async ({ client }, options) => {
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -751,7 +757,8 @@ var server = async ({ client }, options) => {
         args: {
           instruction: z.string().min(1).max(MAX_PROMPT_CHARS).describe("The instruction to perform on each iteration."),
           interval: z.string().optional().describe('Fixed cadence like "30s", "10m", "2h", or "1d". Omit for a dynamically paced loop.'),
-          max_runs: z.number().int().positive().optional().describe("Optional maximum number of iterations before the loop completes.")
+          max_runs: z.number().int().positive().optional().describe("Optional maximum number of iterations before the loop completes."),
+          keep_alive: z.boolean().optional().describe(KEEP_ALIVE_DESCRIPTION)
         },
         async execute(args, context) {
           const input = args;
@@ -763,7 +770,8 @@ var server = async ({ client }, options) => {
             intervalMs: dynamic ? null : parseInterval(input.interval, minIntervalSeconds),
             maxRuns: input.max_runs ?? null,
             agent: typeof context.agent === "string" ? context.agent : null,
-            maxLoopsPerSession
+            maxLoopsPerSession,
+            keepAlive: input.keep_alive === true
           });
           if (loop.mode === "dynamic") {
             dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true });
@@ -1041,7 +1049,7 @@ async function setupV2(context) {
       return;
     }
     loop = claimed;
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
@@ -1066,7 +1074,7 @@ async function setupV2(context) {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
-      if (!observedSessions.has(loop.sessionID)) {
+      if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
         v2Log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID });
         return;
       }
@@ -1084,9 +1092,9 @@ async function setupV2(context) {
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -1279,6 +1287,10 @@ function loopToolsV2(services) {
           type: "integer",
           minimum: 1,
           description: "Optional maximum number of iterations before the loop completes."
+        },
+        keep_alive: {
+          type: "boolean",
+          description: KEEP_ALIVE_DESCRIPTION
         }
       }, ["instruction"]),
       options: { codemode: false },
@@ -1292,7 +1304,8 @@ function loopToolsV2(services) {
           intervalMs: dynamic ? null : parseInterval(input.interval, services.minIntervalSeconds),
           maxRuns: input.max_runs ?? null,
           agent: typeof toolContext.agent === "string" ? toolContext.agent : null,
-          maxLoopsPerSession: services.maxLoopsPerSession
+          maxLoopsPerSession: services.maxLoopsPerSession,
+          keepAlive: input.keep_alive === true
         });
         if (loop.mode === "dynamic") {
           services.dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true });

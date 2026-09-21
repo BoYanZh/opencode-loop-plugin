@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import serverModule from "../src/server"
@@ -291,4 +291,130 @@ test("rehydrates persisted active loops on startup", async () => {
   expect(sent.length).toBeGreaterThanOrEqual(1)
   expect(sent[0]?.text).toContain(created.created)
   await second.dispose?.()
+})
+
+test("a keep-alive loop survives age expiry that would stop an ordinary loop", async () => {
+  const sent: SentPrompt[] = []
+  const first = await makeServer(sent)
+  const durable = JSON.parse(
+    await tool(first, "create_loop").execute(
+      { instruction: "hold the future open", interval: "1s", keep_alive: true },
+      { sessionID: "ses_keep" },
+    ),
+  ) as { created: string }
+  const ordinary = JSON.parse(
+    await tool(first, "create_loop").execute({ instruction: "ordinary", interval: "1s" }, { sessionID: "ses_keep" }),
+  ) as { created: string }
+  await first.dispose?.()
+
+  // Backdate both well past the expiry window.
+  const statePath = process.env.OPENCODE_LOOP_STATE_PATH!
+  const state = JSON.parse(await readFile(statePath, "utf8")) as {
+    loops: Record<string, { createdAt: number; nextRunAt: number }>
+  }
+  for (const id of [durable.created, ordinary.created]) {
+    state.loops[id]!.createdAt = Date.now() - 400 * 24 * 60 * 60 * 1000
+    state.loops[id]!.nextRunAt = Date.now() - 1000
+  }
+  await writeFile(statePath, JSON.stringify(state))
+
+  const second = await makeServer(sent, { max_loop_age_days: 7 })
+  await sleep(600)
+
+  expect((await getLoop(durable.created))?.status).toBe("active")
+  expect((await getLoop(ordinary.created))?.status).toBe("stopped")
+  await second.dispose?.()
+})
+
+test("a keep-alive loop retries in a session this process never observed", async () => {
+  const sent: SentPrompt[] = []
+  const first = await makeServer(sent)
+  const durable = JSON.parse(
+    await tool(first, "create_loop").execute(
+      { instruction: "hold the future open", interval: "1s", keep_alive: true },
+      { sessionID: "ses_detached" },
+    ),
+  ) as { created: string }
+  await first.dispose?.()
+
+  // A fresh process never sees an event for the detached session, and the
+  // prompt fails: the loop must record the failure and re-arm, not stall.
+  const second = await makeServer(sent, undefined, { failPrompts: true })
+  await sleep(1300)
+
+  const loop = await getLoop(durable.created)
+  expect(loop?.status).toBe("active")
+  expect(loop?.lastResult).toBe("failed")
+  expect(loop?.nextRunAt).not.toBeNull()
+  await second.dispose?.()
+})
+
+test("an ordinary loop still defers to the owning process when unobserved", async () => {
+  const sent: SentPrompt[] = []
+  const first = await makeServer(sent)
+  const ordinary = JSON.parse(
+    await tool(first, "create_loop").execute({ instruction: "ordinary", interval: "1s" }, { sessionID: "ses_other_proc" }),
+  ) as { created: string }
+  await first.dispose?.()
+
+  const second = await makeServer(sent, undefined, { failPrompts: true })
+  await sleep(1300)
+
+  // Left alone for the process that owns it: no failure recorded.
+  expect((await getLoop(ordinary.created))?.lastResult).toBeNull()
+  await second.dispose?.()
+})
+
+test("a keep-alive loop survives a restart and keeps firing", async () => {
+  const sent: SentPrompt[] = []
+  const first = await makeServer(sent)
+  const durable = JSON.parse(
+    await tool(first, "create_loop").execute(
+      { instruction: "hold the future open", interval: "1s", keep_alive: true },
+      { sessionID: "ses_restart" },
+    ),
+  ) as { created: string }
+  await first.dispose?.()
+
+  const second = await makeServer(sent)
+  await sleep(1300)
+
+  expect(sent.map((entry) => entry.sessionID)).toContain("ses_restart")
+  expect((await getLoop(durable.created))?.status).toBe("active")
+  await second.dispose?.()
+})
+
+test("a keep-alive future ends only when the agent stops it", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+  const durable = JSON.parse(
+    await tool(hooks, "create_loop").execute(
+      { instruction: "hold the future open", interval: "1s", keep_alive: true },
+      { sessionID: "ses_stop" },
+    ),
+  ) as { created: string }
+
+  // Several iterations pass without the agent ever stopping the loop. The
+  // injected turn marks the session busy, so each iteration needs its idle.
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    await sleep(1200)
+    await idle(hooks, "ses_stop")
+  }
+  expect((await getLoop(durable.created))?.status).toBe("active")
+  expect((await getLoop(durable.created))?.runCount).toBeGreaterThanOrEqual(3)
+
+  await tool(hooks, "stop_loop").execute({ loop_id: durable.created }, { sessionID: "ses_stop" })
+  expect((await getLoop(durable.created))?.status).toBe("stopped")
+  await hooks.dispose?.()
+})
+
+test("keep_alive requires a fixed interval", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+
+  await expect(
+    tool(hooks, "create_loop").execute({ instruction: "no cadence", keep_alive: true }, { sessionID: "ses_bad" }),
+  ).rejects.toThrow(/keep-alive loops require a fixed interval/)
+
+  await hooks.dispose?.()
 })

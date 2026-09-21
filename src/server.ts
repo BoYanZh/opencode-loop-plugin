@@ -40,6 +40,9 @@ type Options = {
   restricted_agents?: string[]
 }
 
+const KEEP_ALIVE_DESCRIPTION =
+  "Keep this session alive across turns until the agent explicitly stops the loop. Requires a fixed interval. Use it in a background or subagent session whose work outlives the turn that started it: the scheduler keeps re-prompting the session on the cadence, and the loop is never ended automatically by age expiry. You remain responsible for calling stop_loop once the work is resolved or abandoned."
+
 const DEFAULT_COMMAND_NAME = "loop"
 const DEFAULT_BUSY_BACKOFF_SECONDS = 60
 const DEFAULT_FAILURE_BACKOFF_SECONDS = 60
@@ -185,7 +188,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
       return
     }
     loop = claimed
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    // A keep-alive loop ends only when the agent says so, so age expiry and the
+    // other automatic stops do not apply to it.
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86_400_000)} days`)
       return
     }
@@ -216,7 +221,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       })
     } catch (error) {
       dynamicPending.delete(loopID)
-      if (!observedSessions.has(loop.sessionID)) {
+      // A keep-alive loop is expected to run in a detached session this process
+      // may never observe, so it re-arms instead of being left to the claim
+      // lease. claimDueRun still keeps concurrent processes off the same run.
+      if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
         // Likely a session owned by another OpenCode process sharing the state
         // file: leave its record alone and stop driving it from this process.
         await log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID })
@@ -302,9 +310,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
             .optional()
             .describe('Fixed cadence like "30s", "10m", "2h", or "1d". Omit for a dynamically paced loop.'),
           max_runs: z.number().int().positive().optional().describe("Optional maximum number of iterations before the loop completes."),
+          keep_alive: z.boolean().optional().describe(KEEP_ALIVE_DESCRIPTION),
         },
         async execute(args, context) {
-          const input = args as { instruction: string; interval?: string; max_runs?: number }
+          const input = args as { instruction: string; interval?: string; max_runs?: number; keep_alive?: boolean }
           observedSessions.add(context.sessionID)
           const dynamic = !input.interval?.trim()
           const loop = await createLoop(context.sessionID, {
@@ -314,6 +323,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
             maxRuns: input.max_runs ?? null,
             agent: typeof context.agent === "string" ? context.agent : null,
             maxLoopsPerSession,
+            keepAlive: input.keep_alive === true,
           })
           if (loop.mode === "dynamic") {
             dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true })
@@ -617,7 +627,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       return
     }
     loop = claimed
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    // A keep-alive loop ends only when the agent says so, so age expiry and the
+    // other automatic stops do not apply to it.
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86_400_000)} days`)
       return
     }
@@ -646,7 +658,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       })
     } catch (error) {
       dynamicPending.delete(loopID)
-      if (!observedSessions.has(loop.sessionID)) {
+      // A keep-alive loop is expected to run in a detached session this process
+      // may never observe, so it re-arms instead of being left to the claim
+      // lease. claimDueRun still keeps concurrent processes off the same run.
+      if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
         // Likely a session owned by another OpenCode process sharing the state
         // file: leave its record alone and stop driving it from this process.
         v2Log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID })
@@ -870,12 +885,16 @@ function loopToolsV2(services: LoopServices): ToolV2Info[] {
             minimum: 1,
             description: "Optional maximum number of iterations before the loop completes.",
           },
+          keep_alive: {
+            type: "boolean",
+            description: KEEP_ALIVE_DESCRIPTION,
+          },
         },
         ["instruction"],
       ),
       options: { codemode: false },
       execute: async (args, toolContext) => {
-        const input = args as { instruction: string; interval?: string; max_runs?: number }
+        const input = args as { instruction: string; interval?: string; max_runs?: number; keep_alive?: boolean }
         services.observedSessions.add(toolContext.sessionID)
         const dynamic = !input.interval?.trim()
         const loop = await createLoop(toolContext.sessionID, {
@@ -885,6 +904,7 @@ function loopToolsV2(services: LoopServices): ToolV2Info[] {
           maxRuns: input.max_runs ?? null,
           agent: typeof toolContext.agent === "string" ? toolContext.agent : null,
           maxLoopsPerSession: services.maxLoopsPerSession,
+          keepAlive: input.keep_alive === true,
         })
         if (loop.mode === "dynamic") {
           services.dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true })
