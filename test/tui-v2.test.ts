@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
-import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode-ai/client"
+import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
 import plugin, { loopsFromV2Messages, setupTuiV2 } from "../src/tui"

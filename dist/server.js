@@ -224,7 +224,7 @@ async function createLoop(sessionID, options) {
   const maxLoops = positiveIntegerOrNull(options.maxLoopsPerSession) ?? DEFAULT_MAX_LOOPS_PER_SESSION;
   const agent = typeof options.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   return mutate((state) => {
-    const open = Object.values(state.loops).filter((loop2) => loop2.sessionID === sessionID && isOpen(loop2.status));
+    const open = Object.values(state.loops).filter((loop) => loop.sessionID === sessionID && isOpen(loop.status));
     if (open.length >= maxLoops) {
       throw new Error(`this session already has ${open.length} open loop(s); stop one before creating another (limit ${maxLoops})`);
     }
@@ -687,9 +687,9 @@ var server = async ({ client }, options) => {
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -1084,9 +1084,9 @@ async function setupV2(context) {
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
