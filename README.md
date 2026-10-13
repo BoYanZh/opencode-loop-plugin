@@ -13,7 +13,7 @@ The OpenCode Loop Plugin adds:
 - `/loop <interval> <instruction>` and `/loop <instruction>` (dynamic pacing) as an OpenCode command for TUI, desktop, and web.
 - A server-side scheduler with per-loop timers that injects a synthetic iteration prompt only when the session is idle, with busy backoff.
 - Dynamic loops where the agent itself picks the delay before each next iteration via `schedule_next_run`, mirroring Claude Code's self-paced `/loop`.
-- Keep-alive loops: `create_loop({ keep_alive: true })` holds a background or subagent session running across turns until the agent stops it, so work that outlives the turn that started it is never ended by the scheduler.
+- Keep-alive loops: `create_loop({ keep_alive: true })` keeps a background or subagent session scheduled across turns and exempts it from age expiry.
 - Agent tools: `create_loop`, `list_loops`, `stop_loop`, `pause_loop`, `resume_loop`, `run_loop`, `schedule_next_run`, and `clear_loops`.
 - Persistent loop state that survives OpenCode restarts, with atomic writes and owner-only file permissions.
 - A TUI sidebar with live countdowns and a `Loops` command-palette entry to run, pause, resume, or stop loops.
@@ -133,7 +133,9 @@ create_loop(
 )
 ```
 
-The session keeps being re-prompted on the cadence until the agent calls `stop_loop` — because the work is resolved, or because it is giving up. The scheduler never ends a keep-alive loop on its own: it is exempt from the age expiry that stops ordinary loops, it survives an OpenCode restart, and it keeps retrying in a detached session this process never observed instead of quietly stalling.
+The session keeps being re-prompted on the cadence and is exempt from age expiry. After an OpenCode restart, the plugin verifies that the session is accessible in the current host location before acquiring its ownership lease and restoring the timer. Sessions in another location or unavailable to this host remain dormant; ordinary loops still require an authoritative session observation.
+
+Explicit `max_runs`, session deletion, and manual pause/stop still apply. Failed injections retain bounded backoff and pause after `max_consecutive_failures`; inspect the loop and use `resume_loop` after resolving the failure. Call `stop_loop` when the work resolves or is abandoned.
 
 `keep_alive` requires a fixed interval. Dynamic pacing hands the next run to the agent every turn, so a single missed `schedule_next_run` would end the very future the flag exists to hold open; that combination is rejected when the loop is created.
 
@@ -143,7 +145,7 @@ Handing a result back to whoever asked for the work stays the agent's job. This 
 
 - Iterations only run while the session is idle. If a loop comes due while the session is busy, it is deferred with a short backoff and retried when the session goes idle.
 - If several loops in one session are due at once, one iteration is injected and the rest wait for the next idle.
-- Failed injections are recorded in the loop's `lastError` and retried after a backoff; they never crash OpenCode.
+- Failed injections store only the safe `provider/model request failed` category. They use bounded exponential backoff and are paused after five consecutive failures by default; provider responses and session data are never persisted or logged.
 - Loops are stopped automatically when their session is deleted, when `max_runs` is reached, or after 7 days (configurable).
 
 ## Options
@@ -160,6 +162,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "max_loops_per_session": 5,
         "busy_backoff_seconds": 60,
         "failure_backoff_seconds": 60,
+        "max_failure_backoff_seconds": 3600,
+        "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
         "restricted_agents": ["plan"],
@@ -183,6 +187,8 @@ In OpenCode 2, use the plugin object form:
         "max_loops_per_session": 5,
         "busy_backoff_seconds": 60,
         "failure_backoff_seconds": 60,
+        "max_failure_backoff_seconds": 3600,
+        "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
         "restricted_agents": ["plan"],
@@ -199,7 +205,9 @@ Defaults:
 - `min_interval_seconds`: `30`; the smallest accepted interval and the lower clamp for dynamic delays.
 - `max_loops_per_session`: `5` open (active or paused) loops per session.
 - `busy_backoff_seconds`: `60`; retry delay when an iteration comes due while the session is busy.
-- `failure_backoff_seconds`: `60`; retry delay when injecting the iteration prompt fails.
+- `failure_backoff_seconds`: `60`; base retry delay when injecting the iteration prompt fails. Consecutive failures double this delay.
+- `max_failure_backoff_seconds`: `3600`; upper bound for exponential failure backoff, including the first retry.
+- `max_consecutive_failures`: `5`; number of consecutive provider/model failures after which the loop is paused with an inspectable `blockedReason`.
 - `max_loop_age_days`: `7`; loops stop automatically after this age. Set `0` to disable expiry.
 - `dynamic_max_delay_seconds`: `86400`; upper clamp for `schedule_next_run` delays.
 - `restricted_agents`: `["plan"]`; iterations are deferred while the session's last prompt came from one of these agents.
@@ -222,7 +230,12 @@ If `XDG_DATA_HOME` is not set, the default is:
 
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
 
-The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
+The state file is written atomically with owner-only permissions when the host filesystem supports it. Persisted loops are rehydrated only after authoritative session context establishes a renewable session lease, preventing concurrent OpenCode instances from driving the same session. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
+
+
+Session lease revisions identify ownership epochs; heartbeats keep the current epoch stable. Claims and automatic dynamic-loop cleanup are checked against that session epoch. Pausing, stopping, or explicitly rescheduling a loop invalidates any pending delivery claim.
+
+State mutations use an atomic lock with a process ID and unique owner token. A suspended live writer keeps its lock; a crashed writer's lock is recovered only after its process has exited. Waiting for a live writer times out after 30 seconds rather than stealing its lock. This coordinates processes on the same host; sharing one state path between different hosts is unsupported.
 
 ## Credits
 
