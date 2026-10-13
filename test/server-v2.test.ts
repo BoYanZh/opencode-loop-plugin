@@ -349,9 +349,8 @@ test("V2 busy/idle events defer and then inject loop iterations", async () => {
     contentOf(await loopTool(mock, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())),
   ) as { created: string }
 
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_busy")
   expect(mock.promptCalls).toHaveLength(0)
-  expect((await getLoop(created.created))?.lastResult).toBe("skipped_busy")
 
   mock.activeSessions.delete("ses_v2")
   mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })

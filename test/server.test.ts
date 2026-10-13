@@ -94,7 +94,7 @@ test("create_loop schedules an iteration and injects the prompt when due", async
   ) as { created: string }
 
   expect(created.created).toMatch(/^loop_/)
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
 
   expect(sent).toHaveLength(1)
   expect(sent[0]?.sessionID).toBe("ses_1")
@@ -188,7 +188,7 @@ test("dynamic loops continue while schedule_next_run keeps being called", async 
   await idle(hooks, "ses_1")
   expect((await getLoop(created.created))?.status).toBe("active")
 
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
   expect(sent).toHaveLength(1)
   expect(sent[0]?.text).toContain("schedule_next_run")
 
@@ -223,7 +223,7 @@ test("failed injections record a safe category and stay active for retry", async
     await tool(hooks, "create_loop").execute({ instruction: "say tick", interval: "1s" }, { sessionID: "ses_1" }),
   ) as { created: string }
 
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.lastResult === "failed")
   const loop = await getLoop(created.created)
   expect(loop?.lastResult).toBe("failed")
   expect(loop?.lastError).toBe("provider/model request failed")
@@ -253,13 +253,13 @@ test("restricted agents defer loop iterations", async () => {
     await tool(hooks, "create_loop").execute({ instruction: "say tick", interval: "1s" }, { sessionID: "ses_1" }),
   ) as { created: string }
 
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_plan")
   expect(sent).toHaveLength(0)
   expect((await getLoop(created.created))?.lastResult).toBe("skipped_plan")
 
   await hooks["chat.message"]?.({ sessionID: "ses_1", agent: "build" } as never, { message: {} } as never)
   await idle(hooks, "ses_1")
-  await sleep(1500)
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
   expect(sent.length).toBeGreaterThanOrEqual(1)
   await hooks.dispose?.()
 })
@@ -304,7 +304,7 @@ test("rehydrated loops resume after an authoritative idle event", async () => {
   await sleep(1300)
   expect(sent).toHaveLength(0)
   await second.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as never)
-  await sleep(1100)
+  await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
   expect(sent.length).toBeGreaterThanOrEqual(1)
   expect(sent[0]?.text).toContain(created.created)
   await second.dispose?.()
@@ -348,7 +348,7 @@ test("slow accepted delivery retains run accounting after the initial owner leas
     const created = JSON.parse(await tool(hooks, "create_loop").execute(
       { instruction: "tick", interval: "1s", max_runs: 1 }, { sessionID: "ses_slow" },
     )) as { created: string }
-    await sleep(1300)
+    await waitFor(async () => (await getLoop(created.created))?.status === "completed")
     expect(sent).toHaveLength(1)
     const loop = await getLoop(created.created)
     expect(loop?.runCount).toBe(1)
@@ -386,7 +386,8 @@ test("a keep-alive loop survives age expiry that would stop an ordinary loop", a
 
   const second = await makeServer(sent, { max_loop_age_days: 7 })
   await idle(second, "ses_keep")
-  await sleep(600)
+  await waitFor(async () => (await getLoop(ordinary.created))?.status === "stopped" &&
+    (await getLoop(durable.created))?.runCount === 1)
 
   expect((await getLoop(durable.created))?.status).toBe("active")
   expect((await getLoop(ordinary.created))?.status).toBe("stopped")
@@ -407,7 +408,7 @@ test("a keep-alive loop retries in a session this process never observed", async
   // A fresh process never sees an event for the detached session, and the
   // prompt fails: the loop must record the failure and re-arm, not stall.
   const second = await makeServer(sent, undefined, { failPrompts: true })
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(durable.created))?.lastResult === "failed")
 
   const loop = await getLoop(durable.created)
   expect(loop?.status).toBe("active")
@@ -444,7 +445,7 @@ test("a keep-alive loop survives a restart and keeps firing", async () => {
   await first.dispose?.()
 
   const second = await makeServer(sent)
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(durable.created))?.runCount === 1)
 
   expect(sent.map((entry) => entry.sessionID)).toContain("ses_restart")
   expect((await getLoop(durable.created))?.status).toBe("active")
@@ -464,7 +465,7 @@ test("a keep-alive future ends only when the agent stops it", async () => {
   // Several iterations pass without the agent ever stopping the loop. The
   // injected turn marks the session busy, so each iteration needs its idle.
   for (let iteration = 0; iteration < 3; iteration += 1) {
-    await sleep(1200)
+    await waitFor(async () => ((await getLoop(durable.created))?.runCount ?? 0) >= iteration + 1)
     await idle(hooks, "ses_stop")
   }
   expect((await getLoop(durable.created))?.status).toBe("active")
@@ -502,7 +503,7 @@ test("keep-alive recovery does not wake ordinary siblings without observation", 
   const ordinary = await createLoop("ses_shared", { prompt: "ordinary", intervalMs: 1 })
   const sent: SentPrompt[] = []
   const hooks = await makeServer(sent)
-  await sleep(200)
+  await waitFor(async () => (await getLoop(durable.id))?.runCount === 1)
   expect(sent).toHaveLength(1)
   expect(sent[0]?.text).toContain(durable.id)
   expect((await getLoop(ordinary.id))?.lastResult).toBeNull()
@@ -514,11 +515,11 @@ test("keep-alive recovery retains bounded failure pause and explicit resume", as
   const sent: SentPrompt[] = []
   const failures = { failPrompts: true }
   const hooks = await makeServer(sent, { max_consecutive_failures: 1 }, failures)
-  await sleep(300)
+  await waitFor(async () => (await getLoop(loop.id))?.status === "paused")
   expect((await getLoop(loop.id))?.status).toBe("paused")
   failures.failPrompts = false
   await tool(hooks, "resume_loop").execute({ loop_id: loop.id }, { sessionID: "ses_retry" })
-  await sleep(300)
+  await waitFor(async () => (await getLoop(loop.id))?.runCount === 1)
   expect((await getLoop(loop.id))?.status).toBe("active")
   expect((await getLoop(loop.id))?.runCount).toBe(1)
   await hooks.dispose?.()
@@ -532,11 +533,11 @@ test("V1 recovered keep-alive defers while the authoritative host session is bus
   let busy = true
   client.session.status = async () => ({ data: busy ? { ses_busy: { type: "busy" } } : {} })
   const hooks = await serverModule.server({ client } as never, { min_interval_seconds: 1 } as never)
-  await sleep(300)
+  await waitFor(async () => (await getLoop(loop.id))?.lastResult === "skipped_busy")
   expect(sent).toHaveLength(0)
   expect((await getLoop(loop.id))?.lastResult).toBe("skipped_busy")
   busy = false
-  await sleep(300)
+  await waitFor(async () => (await getLoop(loop.id))?.runCount === 1)
   expect(sent).toHaveLength(1)
   expect((await getLoop(loop.id))?.runCount).toBe(1)
   await hooks.dispose?.()
