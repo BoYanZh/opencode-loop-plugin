@@ -77,6 +77,15 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function waitFor(predicate: () => boolean | Promise<boolean>) {
+  const deadline = performance.now() + 3000
+  while (performance.now() < deadline) {
+    if (await predicate()) return
+    await sleep(10)
+  }
+  expect(await predicate()).toBe(true)
+}
+
 test("create_loop schedules an iteration and injects the prompt when due", async () => {
   const sent: SentPrompt[] = []
   const hooks = await makeServer(sent)
@@ -108,12 +117,11 @@ test("busy sessions defer iterations until idle", async () => {
     await tool(hooks, "create_loop").execute({ instruction: "say tick", interval: "1s" }, { sessionID: "ses_1" }),
   ) as { created: string }
 
-  await sleep(1300)
+  await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_busy")
   expect(sent).toHaveLength(0)
-  expect((await getLoop(created.created))?.lastResult).toBe("skipped_busy")
 
   await idle(hooks, "ses_1")
-  await sleep(1300)
+  await waitFor(() => sent.length >= 1)
   expect(sent.length).toBeGreaterThanOrEqual(1)
   await hooks.dispose?.()
 })
