@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { chmod, mkdir, link, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
@@ -6,6 +7,13 @@ import { Data, Effect, Schema } from "effect"
 export type LoopStatus = "active" | "paused" | "stopped" | "completed"
 export type LoopMode = "interval" | "dynamic"
 export type LoopRunResult = "sent" | "skipped_busy" | "skipped_plan" | "failed"
+
+export type SessionLease = {
+  sessionID: string
+  instanceID: string
+  expiresAt: number
+  revision: number
+}
 
 export type CreateLoopOptions = {
   prompt: string
@@ -29,16 +37,27 @@ export type Loop = {
   lastRunAt: number | null
   lastResult: LoopRunResult | null
   lastError: string | null
+  consecutiveFailures: number
+  nextRetryAt: number | null
+  blockedReason: string | null
   lastReason: string | null
   runCount: number
   maxRuns: number | null
   agent: string | null
   stopReason: string | null
+  ownerID: string | null
+  ownerLeaseUntil: number | null
+  ownerRevision: number
+  runClaimToken: number
 }
+
+export type LoopOwnerLease = { ownerID: string; ownerRevision: number; sessionLease?: SessionLease }
+export type RunClaim = LoopOwnerLease & { claimToken: number; loop: LoopSnapshot }
 
 type State = {
   version: 1
   loops: Record<string, Loop>
+  sessionLeases: Record<string, SessionLease>
 }
 
 class StateReadError extends Data.TaggedError("StateReadError")<{
@@ -75,15 +94,31 @@ const LoopSchema = Schema.Struct({
     default: () => null,
   }),
   lastError: Schema.optionalWith(NullableString, { default: () => null }),
+  consecutiveFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  nextRetryAt: Schema.optionalWith(NullableNumber, { default: () => null }),
+  blockedReason: Schema.optionalWith(NullableString, { default: () => null }),
   lastReason: Schema.optionalWith(NullableString, { default: () => null }),
   runCount: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   maxRuns: Schema.optionalWith(NullableNumber, { default: () => null }),
   agent: Schema.optionalWith(NullableString, { default: () => null }),
   stopReason: Schema.optionalWith(NullableString, { default: () => null }),
+  ownerID: Schema.optionalWith(NullableString, { default: () => null }),
+  ownerLeaseUntil: Schema.optionalWith(NullableNumber, { default: () => null }),
+  ownerRevision: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  runClaimToken: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+})
+const SessionLeaseSchema = Schema.Struct({
+  sessionID: Schema.String,
+  instanceID: Schema.String,
+  expiresAt: Schema.Number,
+  revision: Schema.Number,
 })
 const StateSchema = Schema.Struct({
   version: Schema.Literal(1),
   loops: Schema.Record({ key: Schema.String, value: LoopSchema }),
+  sessionLeases: Schema.optionalWith(Schema.Record({ key: Schema.String, value: SessionLeaseSchema }), {
+    default: () => ({}),
+  }),
 })
 
 export type LoopSnapshot = Loop & {
@@ -106,7 +141,7 @@ function now() {
 }
 
 function emptyState(): State {
-  return { version: 1, loops: {} }
+  return { version: 1, loops: {}, sessionLeases: {} }
 }
 
 function isMissingStateFile(error: unknown) {
@@ -171,8 +206,6 @@ function enqueueMutation<T>(operation: () => Promise<T>) {
   return current
 }
 
-const MAX_MUTATION_ATTEMPTS = 5
-
 async function readRawState() {
   try {
     return await readFile(statePath(), "utf8")
@@ -182,13 +215,82 @@ async function readRawState() {
   }
 }
 
+const LOCK_WAIT_MS = 30_000
+const LOCK_RETRY_MS = 10
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function processIsAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH"
+  }
+}
+
+async function acquireProcessLock(lock: string, deadline: number): Promise<() => Promise<void>> {
+  const token = `${process.pid}-${randomUUID()}`
+  const ownerPath = `${lock}.owner.${token}`
+  await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
+  let acquired = false
+  try {
+    for (;;) {
+      try {
+        // Publish the complete identity atomically without requiring symlink privileges.
+        await link(ownerPath, lock)
+        acquired = true
+        return async () => {
+          try {
+            if (await readFile(lock, "utf8").catch(() => null) === token) await rm(lock, { force: true })
+          } finally {
+            await rm(ownerPath, { force: true })
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        try {
+          const owner = await readFile(lock, "utf8")
+          const pid = Number(owner.split("-", 1)[0])
+          if (/^\d+-[0-9a-f-]{36}$/.test(owner) && !processIsAlive(pid)) {
+            // Recover the guard by the same protocol if a previous reclaimer died.
+            const release = await acquireProcessLock(`${lock}.reclaim.${owner}`, deadline)
+            try {
+              if (await readFile(lock, "utf8").catch(() => null) === owner) {
+                await rm(lock, { force: true })
+                await rm(`${lock}.owner.${owner}`, { force: true })
+              }
+            } finally {
+              await release()
+            }
+          }
+        } catch (lockError) {
+          if (!isMissingStateFile(lockError)) throw lockError
+        }
+        if (Date.now() >= deadline) throw new Error("timed out waiting for the loop state lock", { cause: error })
+        await sleep(LOCK_RETRY_MS)
+      }
+    }
+  } finally {
+    if (!acquired) await rm(ownerPath, { force: true })
+  }
+}
+
+async function acquireMutationLock() {
+  const file = statePath()
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  return acquireProcessLock(`${file}.lock`, Date.now() + LOCK_WAIT_MS)
+}
+
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
-  // The promise queue serializes mutations within this process; the raw-content
-  // compare before writing detects concurrent writers in other OpenCode
-  // processes sharing the state file and retries on top of their changes.
   return enqueueMutation(async () => {
-    let lastError: unknown
-    for (let attempt = 0; attempt < MAX_MUTATION_ATTEMPTS; attempt += 1) {
+    // mkdir is atomic across processes. Holding this lock across the read,
+    // predicate, and atomic rename makes conditional mutations true
+    // compare-and-swap operations for every plugin context using this state.
+    const release = await acquireMutationLock()
+    try {
       const before = await readRawState()
       const result = await Effect.runPromise(
         Effect.gen(function* () {
@@ -206,15 +308,11 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
           return { state, value }
         }),
       )
-      const current = await readRawState()
-      if (current !== before) {
-        lastError = new Error("state file changed by a concurrent writer")
-        continue
-      }
       await Effect.runPromise(writeStateEffect(result.state))
       return result.value
+    } finally {
+      await release()
     }
-    throw lastError instanceof Error ? lastError : new Error("state mutation failed after concurrent-writer retries")
   })
 }
 
@@ -319,11 +417,18 @@ export async function createLoop(sessionID: string, options: CreateLoopOptions) 
       lastRunAt: null,
       lastResult: null,
       lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      blockedReason: null,
       lastReason: null,
       runCount: 0,
       maxRuns,
       agent,
       stopReason: null,
+      ownerID: null,
+      ownerLeaseUntil: null,
+      ownerRevision: 0,
+      runClaimToken: 0,
     }
     state.loops[id] = loop
     return snapshot(loop)
@@ -334,6 +439,62 @@ export async function getLoop(loopID: string) {
   const state = await readState()
   const loop = state.loops[loopID]
   return loop ? snapshot(loop) : null
+}
+
+function validLeaseMs(value: number) {
+  const leaseMs = positiveIntegerOrNull(Math.round(value))
+  if (leaseMs == null) throw new Error("session lease must be a positive number of milliseconds")
+  return leaseMs
+}
+
+/** Atomically acquires an absent/expired lease, or renews this instance's lease. */
+export async function acquireSessionLease(sessionID: string, instanceID: string, leaseMs: number) {
+  const duration = validLeaseMs(leaseMs)
+  return mutate((state) => {
+    const timestamp = now()
+    const current = state.sessionLeases[sessionID]
+    if (current && current.instanceID !== instanceID && current.expiresAt > timestamp) return null
+    const lease: SessionLease = {
+      sessionID,
+      instanceID,
+      expiresAt: timestamp + duration,
+      revision: current?.instanceID === instanceID && current.expiresAt > timestamp
+        ? current.revision
+        : (current?.revision ?? 0) + 1,
+    }
+    state.sessionLeases[sessionID] = lease
+    return { ...lease }
+  })
+}
+
+/** Renews only the exact lease revision previously returned to this instance. */
+export async function renewSessionLease(sessionID: string, instanceID: string, revision: number, leaseMs: number) {
+  const duration = validLeaseMs(leaseMs)
+  return mutate((state) => {
+    const timestamp = now()
+    const current = state.sessionLeases[sessionID]
+    if (!current || current.instanceID !== instanceID || current.revision !== revision || current.expiresAt <= timestamp) return null
+    current.expiresAt = timestamp + duration
+    return { ...current }
+  })
+}
+
+/** Checks persisted ownership without extending it. */
+export async function ownsSessionLease(sessionID: string, instanceID: string, revision: number) {
+  const state = await readState()
+  const lease = state.sessionLeases[sessionID]
+  return Boolean(lease && lease.instanceID === instanceID && lease.revision === revision && lease.expiresAt > now())
+}
+
+/** Releases only the exact lease held by this instance; stale owners are no-ops. */
+export async function releaseSessionLease(sessionID: string, instanceID: string, revision: number) {
+  return mutate((state) => {
+    const current = state.sessionLeases[sessionID]
+    if (!current || current.instanceID !== instanceID || current.revision !== revision) return false
+    // Retain the epoch so reacquiring with the same instance ID cannot revive old claims.
+    current.expiresAt = 0
+    return true
+  })
 }
 
 export async function claimDueRun(loopID: string, leaseMs: number) {
@@ -347,6 +508,63 @@ export async function claimDueRun(loopID: string, leaseMs: number) {
     loop.updatedAt = timestamp
     return snapshot(loop)
   })
+}
+
+/** Acquire or renew the scheduler-owner lease without changing the run schedule. */
+export async function acquireLoopOwner(loopID: string, ownerID: string, leaseMs: number, sessionLease?: SessionLease) {
+  const lease = positiveIntegerOrNull(Math.round(leaseMs))
+  if (!ownerID.trim()) throw new Error("loop owner id must not be empty")
+  if (lease == null) throw new Error("owner lease must be a positive number of milliseconds")
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    const timestamp = now()
+    if (loop.status !== "active" || (sessionLease && !matchesSessionLease(state, sessionLease, timestamp))) return null
+    if (loop.ownerID !== ownerID && loop.ownerLeaseUntil != null && loop.ownerLeaseUntil > timestamp) return null
+    if (loop.ownerID !== ownerID) loop.ownerRevision += 1
+    loop.ownerID = ownerID
+    loop.ownerLeaseUntil = timestamp + lease
+    loop.updatedAt = timestamp
+    return { ownerID, ownerRevision: loop.ownerRevision, ...(sessionLease ? { sessionLease } : {}) } satisfies LoopOwnerLease
+  })
+}
+
+/** Claim a due run only while the supplied fencing lease is still current. */
+export async function claimDueRunOwned(loopID: string, owner: LoopOwnerLease, leaseMs: number): Promise<RunClaim | null> {
+  const lease = positiveIntegerOrNull(Math.round(leaseMs))
+  if (lease == null) throw new Error("run claim lease must be a positive number of milliseconds")
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    const timestamp = now()
+    if (!matchesOwner(loop, owner, state, timestamp)) return null
+    if (loop.status !== "active" || loop.nextRunAt == null || loop.nextRunAt > timestamp) return null
+    loop.runClaimToken += 1
+    loop.nextRunAt = timestamp + lease
+    loop.updatedAt = timestamp
+    return { ...owner, claimToken: loop.runClaimToken, loop: snapshot(loop) }
+  })
+}
+
+function matchesSessionLease(state: State, expected: SessionLease, timestamp = now()) {
+  const current = state.sessionLeases[expected.sessionID]
+  return current != null && current.instanceID === expected.instanceID &&
+    current.revision === expected.revision && current.expiresAt > timestamp
+}
+
+function matchesOwner(loop: Loop, owner: LoopOwnerLease, state: State, timestamp = now()) {
+  return loop.ownerID === owner.ownerID && loop.ownerRevision === owner.ownerRevision &&
+    (loop.ownerLeaseUntil ?? 0) > timestamp &&
+    (!owner.sessionLease || (owner.sessionLease.sessionID === loop.sessionID && matchesSessionLease(state, owner.sessionLease, timestamp)))
+}
+
+function matchesClaim(loop: Loop, claim: RunClaim, state: State, timestamp = now()) {
+  return matchesOwner(loop, claim, state, timestamp) && loop.runClaimToken === claim.claimToken
+}
+
+export async function confirmRunClaim(loopID: string, claim: RunClaim) {
+  const state = await readState()
+  const loop = state.loops[loopID]
+  return loop != null && loop.status === "active" && loop.nextRunAt === claim.loop.nextRunAt &&
+    matchesClaim(loop, claim, state) ? snapshot(loop) : null
 }
 
 export async function listLoops(sessionID?: string) {
@@ -372,7 +590,9 @@ export async function pauseLoop(loopID: string) {
     const loop = requireLoop(state, loopID)
     if (loop.status !== "active") throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be paused`)
     loop.status = "paused"
+    loop.runClaimToken += 1
     loop.nextRunAt = null
+    loop.nextRetryAt = null
     loop.stopReason = "paused"
     loop.updatedAt = now()
     return snapshot(loop)
@@ -385,7 +605,11 @@ export async function resumeLoop(loopID: string) {
     if (loop.status !== "paused") throw new Error(`loop "${loopID}" is ${loop.status}; only paused loops can be resumed`)
     const timestamp = now()
     loop.status = "active"
+    loop.runClaimToken += 1
     loop.stopReason = null
+    loop.blockedReason = null
+    loop.consecutiveFailures = 0
+    loop.nextRetryAt = null
     loop.nextRunAt = loop.mode === "interval" ? timestamp + loop.intervalMs! : timestamp
     loop.updatedAt = timestamp
     return snapshot(loop)
@@ -398,7 +622,32 @@ export async function stopLoop(loopID: string, reason?: string | null) {
     if (!isOpen(loop.status)) throw new Error(`loop "${loopID}" is already ${loop.status}`)
     loop.status = "stopped"
     loop.nextRunAt = null
+    loop.nextRetryAt = null
     loop.stopReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : "stopped"
+    loop.updatedAt = now()
+    return snapshot(loop)
+  })
+}
+
+export async function stopLoopIfUnchanged(
+  loopID: string,
+  expectedUpdatedAt: number,
+  reason: string,
+  sessionLease?: SessionLease,
+) {
+  return mutate((state) => {
+    const loop = state.loops[loopID]
+    if (!loop || (sessionLease && !matchesSessionLease(state, sessionLease))) return null
+    if (
+      loop.updatedAt !== expectedUpdatedAt ||
+      loop.status !== "active" ||
+      loop.mode !== "dynamic" ||
+      loop.nextRunAt != null
+    ) {
+      return null
+    }
+    loop.status = "stopped"
+    loop.stopReason = reason.trim().slice(0, 400) || "stopped"
     loop.updatedAt = now()
     return snapshot(loop)
   })
@@ -411,6 +660,7 @@ export async function stopLoopsForSession(sessionID: string, reason: string) {
       if (loop.sessionID !== sessionID || !isOpen(loop.status)) continue
       loop.status = "stopped"
       loop.nextRunAt = null
+      loop.nextRetryAt = null
       loop.stopReason = reason
       loop.updatedAt = now()
       stopped.push(snapshot(loop))
@@ -439,6 +689,7 @@ export async function scheduleNextRun(loopID: string, delayMs: number, reason?: 
     if (loop.status !== "active") throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be scheduled`)
     const timestamp = now()
     loop.nextRunAt = timestamp + delay
+    loop.nextRetryAt = null
     loop.lastReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : loop.lastReason
     loop.updatedAt = timestamp
     return snapshot(loop)
@@ -454,6 +705,9 @@ export async function recordRunSent(loopID: string) {
     loop.lastRunAt = timestamp
     loop.lastResult = "sent"
     loop.lastError = null
+    loop.consecutiveFailures = 0
+    loop.nextRetryAt = null
+    loop.blockedReason = null
     loop.updatedAt = timestamp
     if (loop.maxRuns != null && loop.runCount >= loop.maxRuns) {
       loop.status = "completed"
@@ -468,26 +722,143 @@ export async function recordRunSent(loopID: string) {
   })
 }
 
+export async function recordRunSentClaimed(loopID: string, claim: RunClaim) {
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active") return null
+    const rescheduled = loop.nextRunAt !== claim.loop.nextRunAt
+    const timestamp = now()
+    loop.runCount += 1
+    loop.lastRunAt = timestamp
+    loop.lastResult = "sent"
+    loop.lastError = null
+    loop.consecutiveFailures = 0
+    loop.nextRetryAt = null
+    loop.blockedReason = null
+    loop.updatedAt = timestamp
+    if (loop.maxRuns != null && loop.runCount >= loop.maxRuns) {
+      loop.status = "completed"
+      loop.nextRunAt = null
+      loop.stopReason = `max runs reached (${loop.maxRuns})`
+    } else if (!rescheduled) loop.nextRunAt = loop.mode === "interval" ? timestamp + loop.intervalMs! : null
+    return snapshot(loop)
+  })
+}
+
 export async function recordRunDeferred(loopID: string, result: "skipped_busy" | "skipped_plan", retryDelayMs: number) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID)
     if (loop.status !== "active") return snapshot(loop)
     const timestamp = now()
     loop.lastResult = result
+    loop.nextRetryAt = null
     loop.nextRunAt = timestamp + Math.max(0, Math.round(retryDelayMs))
     loop.updatedAt = timestamp
     return snapshot(loop)
   })
 }
 
-export async function recordRunFailed(loopID: string, error: string, retryDelayMs: number) {
+/**
+ * Records a provider/model injection failure. Retries use exponential backoff,
+ * capped by maxRetryDelayMs; after maxConsecutiveFailures the loop is paused.
+ * `error` is deliberately reduced to a fixed category so provider responses,
+ * credentials, prompts, and session data can never enter persisted state.
+ */
+export async function recordRunFailed(
+  loopID: string,
+  _error: string,
+  retryDelayMs: number,
+  maxConsecutiveFailures = 5,
+  maxRetryDelayMs = 60 * 60 * 1000,
+) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID)
     const timestamp = now()
     loop.lastResult = "failed"
-    loop.lastError = error.slice(0, 400)
+    loop.lastError = "provider/model request failed"
+    loop.consecutiveFailures += 1
     loop.updatedAt = timestamp
-    if (loop.status === "active") loop.nextRunAt = timestamp + Math.max(0, Math.round(retryDelayMs))
+    if (loop.status === "active") {
+      if (loop.consecutiveFailures >= Math.max(1, Math.round(maxConsecutiveFailures))) {
+        loop.status = "paused"
+        loop.nextRunAt = null
+        loop.nextRetryAt = null
+        loop.blockedReason = `paused after ${loop.consecutiveFailures} consecutive provider/model failures`
+        loop.stopReason = loop.blockedReason
+      } else {
+        const baseDelay = Math.max(1, Math.round(retryDelayMs))
+        const cap = Math.max(1, Math.round(maxRetryDelayMs))
+        const delay = Math.min(cap, baseDelay * 2 ** (loop.consecutiveFailures - 1))
+        loop.nextRetryAt = timestamp + delay
+        loop.nextRunAt = loop.nextRetryAt
+        loop.blockedReason = null
+      }
+    }
+    return snapshot(loop)
+  })
+}
+
+export async function recordRunFailedClaimed(
+  loopID: string,
+  claim: RunClaim,
+  _error: string,
+  retryDelayMs: number,
+  maxConsecutiveFailures = 5,
+  maxRetryDelayMs = 60 * 60 * 1000,
+) {
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active") return null
+    const timestamp = now()
+    loop.lastResult = "failed"
+    loop.lastError = "provider/model request failed"
+    loop.consecutiveFailures += 1
+    loop.updatedAt = timestamp
+    if (loop.consecutiveFailures >= Math.max(1, Math.round(maxConsecutiveFailures))) {
+      loop.status = "paused"
+      loop.nextRunAt = null
+      loop.nextRetryAt = null
+      loop.blockedReason = `paused after ${loop.consecutiveFailures} consecutive provider/model failures`
+      loop.stopReason = loop.blockedReason
+    } else {
+      const baseDelay = Math.max(1, Math.round(retryDelayMs))
+      const cap = Math.max(1, Math.round(maxRetryDelayMs))
+      const delay = Math.min(cap, baseDelay * 2 ** (loop.consecutiveFailures - 1))
+      loop.nextRetryAt = timestamp + delay
+      loop.nextRunAt = loop.nextRetryAt
+      loop.blockedReason = null
+    }
+    return snapshot(loop)
+  })
+}
+
+export async function recordRunDeferredClaimed(
+  loopID: string,
+  claim: RunClaim,
+  result: "skipped_busy" | "skipped_plan",
+  retryDelayMs: number,
+) {
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active") return null
+    const timestamp = now()
+    loop.lastResult = result
+    loop.nextRetryAt = null
+    loop.nextRunAt = timestamp + Math.max(0, Math.round(retryDelayMs))
+    loop.updatedAt = timestamp
+    return snapshot(loop)
+  })
+}
+
+export async function stopLoopClaimed(loopID: string, claim: RunClaim, reason?: string | null) {
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID)
+    if (!matchesClaim(loop, claim, state) || !isOpen(loop.status)) return null
+    loop.status = "stopped"
+    loop.nextRunAt = null
+    loop.nextRetryAt = null
+    loop.stopReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : "stopped"
+    loop.updatedAt = now()
     return snapshot(loop)
   })
 }
