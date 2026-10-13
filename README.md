@@ -258,6 +258,8 @@ bun run build
 npm pack --dry-run
 ```
 
+The server build bundles its private Effect 3 persistence implementation. Keep it bundled: an OpenCode V2 host can resolve a bare `effect` import to its incompatible Effect 4 runtime. The package regression test loads the built server with an Effect 4 host to cover this boundary. The TUI remains exported as source.
+
 ## Publishing
 
 This package is set up for npm Trusted Publishing from GitHub Actions. On every push to `main`, CI runs typecheck, lint, and unit tests in parallel. If they all pass, the publish job computes the next patch version from the latest version on npm, builds the package, and runs `npm publish`.
