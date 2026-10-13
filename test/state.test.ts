@@ -450,15 +450,24 @@ test("recovers a crashed lock reclaimer", async () => {
   expect((await createLoop("ses_1", { prompt: "tick", mode: "dynamic" })).status).toBe("active")
 })
 
-test("a dynamic iteration counts its run without overwriting the agent's next schedule", async () => {
-  const loop = await createLoop("ses_1", { prompt: "tick", mode: "dynamic", maxRuns: 2 })
-  await scheduleNextRun(loop.id, 1)
-  const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000))!
-  await new Promise((resolve) => setTimeout(resolve, 5))
-  const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
-  expect(await confirmRunClaim(loop.id, claim)).not.toBeNull()
-  const scheduled = await scheduleNextRun(loop.id, 60_000)
-  const sent = await recordRunSentClaimed(loop.id, claim)
-  expect(sent?.runCount).toBe(1)
-  expect(sent?.nextRunAt).toBe(scheduled.nextRunAt)
+test("a dynamic iteration counts its run without overwriting an equal-timestamp next schedule", async () => {
+  const originalNow = Date.now
+  let clock = originalNow()
+  Date.now = () => clock
+  try {
+    const loop = await createLoop("ses_1", { prompt: "tick", mode: "dynamic", maxRuns: 2 })
+    await scheduleNextRun(loop.id, 1)
+    const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000))!
+    clock += 5
+    const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
+    expect(await confirmRunClaim(loop.id, claim)).not.toBeNull()
+    const scheduled = await scheduleNextRun(loop.id, 60_000)
+    expect(scheduled.nextRunAt).toBe(claim.loop.nextRunAt)
+    expect(await confirmRunClaim(loop.id, claim)).toBeNull()
+    const sent = await recordRunSentClaimed(loop.id, claim)
+    expect(sent?.runCount).toBe(1)
+    expect(sent?.nextRunAt).toBe(scheduled.nextRunAt)
+  } finally {
+    Date.now = originalNow
+  }
 })

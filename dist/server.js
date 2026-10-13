@@ -50,7 +50,8 @@ var LoopSchema = Schema.Struct({
   ownerID: Schema.optionalWith(NullableString, { default: () => null }),
   ownerLeaseUntil: Schema.optionalWith(NullableNumber, { default: () => null }),
   ownerRevision: Schema.optionalWith(Schema.Number, { default: () => 0 }),
-  runClaimToken: Schema.optionalWith(Schema.Number, { default: () => 0 })
+  runClaimToken: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  scheduleRevision: Schema.optionalWith(Schema.Number, { default: () => 0 })
 });
 var SessionLeaseSchema = Schema.Struct({
   sessionID: Schema.String,
@@ -336,7 +337,8 @@ async function createLoop(sessionID, options) {
       ownerID: null,
       ownerLeaseUntil: null,
       ownerRevision: 0,
-      runClaimToken: 0
+      runClaimToken: 0,
+      scheduleRevision: 0
     };
     state.loops[id] = loop;
     return snapshot(loop);
@@ -446,7 +448,7 @@ function matchesClaim(loop, claim, state, timestamp = now()) {
 async function confirmRunClaim(loopID, claim) {
   const state = await readState();
   const loop = state.loops[loopID];
-  return loop != null && loop.status === "active" && loop.nextRunAt === claim.loop.nextRunAt && matchesClaim(loop, claim, state) ? snapshot(loop) : null;
+  return loop != null && loop.status === "active" && loop.scheduleRevision === claim.loop.scheduleRevision && matchesClaim(loop, claim, state) ? snapshot(loop) : null;
 }
 async function listLoops(sessionID) {
   const state = await readState();
@@ -555,6 +557,7 @@ async function scheduleNextRun(loopID, delayMs, reason) {
     if (loop.status !== "active")
       throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be scheduled`);
     const timestamp = now();
+    loop.scheduleRevision += 1;
     loop.nextRunAt = timestamp + delay;
     loop.nextRetryAt = null;
     loop.lastReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : loop.lastReason;
@@ -567,7 +570,7 @@ async function recordRunSentClaimed(loopID, claim) {
     const loop = requireLoop(state, loopID);
     if (!matchesClaim(loop, claim, state) || loop.status !== "active")
       return null;
-    const rescheduled = loop.nextRunAt !== claim.loop.nextRunAt;
+    const rescheduled = loop.scheduleRevision !== claim.loop.scheduleRevision;
     const timestamp = now();
     loop.runCount += 1;
     loop.lastRunAt = timestamp;
