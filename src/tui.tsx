@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import type { Plugin as TuiPluginV2 } from "@opencode-ai/plugin-v2/tui"
-import type { SessionMessageInfo } from "@opencode-ai/client"
+import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
+import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 
@@ -458,9 +458,9 @@ function LoopSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     const loops = open()
     if (loops.length === 0) return null
     return box({}, [
-      text({ fg: api.theme.text.default }, ["Loops"]),
+      text({ fg: api.theme.text.base }, ["Loops"]),
       ...loops.map((loop) =>
-        text({ fg: api.theme.text.subdued }, [
+        text({ fg: api.theme.text.muted }, [
           `${loop.status === "paused" ? "paused " : ""}${loopLine(loop, nowMs())}`,
         ]),
       ),

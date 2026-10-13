@@ -1353,6 +1353,7 @@ function v2Log(level, message, extra) {
   } catch {}
 }
 async function setupV2(context) {
+  const abortController = new AbortController;
   const options = context.options ?? {};
   const registerCommand = options.register_command ?? true;
   const commandName = commandNameFromOptions(options);
@@ -1380,21 +1381,41 @@ async function setupV2(context) {
   const dynamicPending = new Map;
   const registrations = [];
   const isRestrictedAgent = (agent) => typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase());
+  const pendingIdleChecks = new Map;
   async function isSessionBusy(sessionID) {
-    const session = context.session;
-    if (typeof session.active !== "function")
-      return busySessions.has(sessionID);
-    try {
-      const active = await session.active();
-      const busy = Object.hasOwn(active, sessionID);
-      if (busy)
-        busySessions.add(sessionID);
-      else
-        busySessions.delete(sessionID);
-      return busy;
-    } catch {
-      return busySessions.has(sessionID);
+    if (abortController.signal.aborted)
+      return true;
+    let check = pendingIdleChecks.get(sessionID);
+    if (!check) {
+      check = Promise.resolve().then(() => context.session.wait({ sessionID })).then(() => true, () => false);
+      pendingIdleChecks.set(sessionID, check);
+      const current = check;
+      check.then(() => {
+        if (pendingIdleChecks.get(sessionID) === current)
+          pendingIdleChecks.delete(sessionID);
+      });
     }
+    const idle = await new Promise((resolve) => {
+      let finished = false;
+      const finish = (value) => {
+        if (finished)
+          return;
+        finished = true;
+        clearTimeout(timer);
+        abortController.signal.removeEventListener("abort", aborted);
+        resolve(value && !abortController.signal.aborted);
+      };
+      const aborted = () => finish(false);
+      const timer = setTimeout(() => finish(false), 1000);
+      abortController.signal.addEventListener("abort", aborted, { once: true });
+      if (abortController.signal.aborted)
+        finish(false);
+      else
+        check.then(finish);
+    });
+    if (idle)
+      busySessions.delete(sessionID);
+    return !idle;
   }
   function cancelTimer(loopID) {
     const timer = timers.get(loopID);
@@ -1415,7 +1436,7 @@ async function setupV2(context) {
     try {
       const session = await context.session.get({ sessionID });
       const location = context.location;
-      return session.id === sessionID && (!location || session.location.directory === location.directory && session.location.workspaceID === location.workspaceID);
+      return session.id === sessionID && (!location || session.location.directory === location.directory && session.projectID === location.project.id);
     } catch {
       return false;
     }
@@ -1752,7 +1773,6 @@ async function setupV2(context) {
     }
   }, SESSION_LEASE_HEARTBEAT_MS);
   leaseHeartbeat.unref?.();
-  const abortController = new AbortController;
   let eventIterator;
   const consumer = (async () => {
     const subscription = context.event.subscribe({ signal: abortController.signal });
@@ -1775,6 +1795,7 @@ async function setupV2(context) {
     await Promise.all(ownershipQueues.values());
     clearInterval(leaseHeartbeat);
     abortController.abort();
+    pendingIdleChecks.clear();
     for (const timer of timers.values())
       clearTimeout(timer);
     timers.clear();

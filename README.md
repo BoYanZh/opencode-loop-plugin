@@ -28,7 +28,7 @@ Choose the instructions that match the CLI you run:
 | OpenCode version | How to identify it | Instructions |
 | --- | --- | --- |
 | OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
-| OpenCode 2 preview | You run `opencode2` | [OpenCode 2](#opencode-2-preview) |
+| OpenCode 2 | You run `opencode` and `opencode --version` prints `2.x` | [OpenCode 2](#opencode-2) |
 
 Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `~/.config/opencode/cli.json`.
 
@@ -64,9 +64,15 @@ OpenCode detects both package entrypoints and writes the plugin into the server 
 }
 ```
 
-### OpenCode 2 Preview
+### OpenCode 2
 
-This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1. Add the package to both V2 plugin lists.
+This plugin supports OpenCode 2 (`2.x`) while remaining compatible with OpenCode 1.
+
+```bash
+opencode plugin add @prevalentware/opencode-loop-plugin
+```
+
+For manual installation, add the package to both V2 plugin lists.
 
 `opencode.json`:
 
@@ -86,7 +92,7 @@ This plugin supports OpenCode 2 preview `0.0.0-next-17055` while remaining compa
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and palette integration are loaded from the global `~/.config/opencode/cli.json`.
 
-The OpenCode 2 plugin API is still in preview. This release targets the exact preview above; later previews may require a plugin update. V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The dedicated V1 compaction-context hook has no V2 equivalent in this preview. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
+V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The plugin does not yet integrate the V2 compaction hook. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
 
 ## Usage
 

@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test"
+import { RGBA } from "@opentui/core"
+import type { ResolvedTheme } from "@opencode/theme/tui"
 import { testRender } from "@opentui/solid"
-import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode-ai/client"
+import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
 import plugin, { loopsFromV2Messages, setupTuiV2 } from "../src/tui"
@@ -70,9 +72,9 @@ function mockContext() {
     attention: undefined,
     theme: {
       text: {
-        default: "#ffffff",
-        subdued: "#888888",
-      },
+        base: RGBA.fromHex("#ffffff"),
+        muted: RGBA.fromHex("#888888"),
+      } satisfies Pick<ResolvedTheme["text"], "base" | "muted">,
     },
     markdown: undefined,
     keymap: { layer: (input: () => Layer) => void layers.push(input) },
