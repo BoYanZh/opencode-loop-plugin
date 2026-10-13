@@ -1,7 +1,7 @@
 import type { Config, Plugin } from "@opencode-ai/plugin"
 import type * as PluginV2 from "@opencode/plugin"
 import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
-import type { Tool as ToolSchema } from "@opencode-ai/schema/tool"
+import type { Tool as ToolSchema } from "@opencode/schema/tool"
 import { randomUUID } from "node:crypto"
 import { z } from "zod"
 import {
@@ -714,6 +714,7 @@ type LoopServices = {
 }
 
 async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugin.Cleanup> {
+  const abortController = new AbortController()
   const options = (context.options ?? {}) as Options
   const registerCommand = options.register_command ?? true
   const commandName = commandNameFromOptions(options)
@@ -752,20 +753,38 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
 
+  const pendingIdleChecks = new Map<string, Promise<boolean>>()
+
   async function isSessionBusy(sessionID: string) {
-    const session = context.session as typeof context.session & {
-      active?: () => Promise<Record<string, { type: "running" }>>
+    if (abortController.signal.aborted) return true
+    let check = pendingIdleChecks.get(sessionID)
+    if (!check) {
+      // The stable adapter does not forward request-option signals. Reuse one
+      // native wait per session while bounding our own scheduler's await.
+      check = Promise.resolve().then(() => context.session.wait({ sessionID })).then(() => true, () => false)
+      pendingIdleChecks.set(sessionID, check)
+      const current = check
+      void check.then(() => {
+        if (pendingIdleChecks.get(sessionID) === current) pendingIdleChecks.delete(sessionID)
+      })
     }
-    if (typeof session.active !== "function") return busySessions.has(sessionID)
-    try {
-      const active = await session.active()
-      const busy = Object.hasOwn(active, sessionID)
-      if (busy) busySessions.add(sessionID)
-      else busySessions.delete(sessionID)
-      return busy
-    } catch {
-      return busySessions.has(sessionID)
-    }
+    const idle = await new Promise<boolean>((resolve) => {
+      let finished = false
+      const finish = (value: boolean) => {
+        if (finished) return
+        finished = true
+        clearTimeout(timer)
+        abortController.signal.removeEventListener("abort", aborted)
+        resolve(value && !abortController.signal.aborted)
+      }
+      const aborted = () => finish(false)
+      const timer = setTimeout(() => finish(false), 1000)
+      abortController.signal.addEventListener("abort", aborted, { once: true })
+      if (abortController.signal.aborted) finish(false)
+      else void check.then(finish)
+    })
+    if (idle) busySessions.delete(sessionID)
+    return !idle
   }
 
   function cancelTimer(loopID: string) {
@@ -787,7 +806,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const session = await context.session.get({ sessionID })
       const location = context.location
       return session.id === sessionID && (!location ||
-        (session.location.directory === location.directory && session.location.workspaceID === location.workspaceID))
+        (session.location.directory === location.directory && session.projectID === location.project.id))
     } catch {
       return false
     }
@@ -1131,7 +1150,6 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }, SESSION_LEASE_HEARTBEAT_MS)
   leaseHeartbeat.unref?.()
 
-  const abortController = new AbortController()
   let eventIterator: AsyncIterator<unknown> | undefined
   const consumer = (async () => {
     const subscription = context.event.subscribe({ signal: abortController.signal })
@@ -1153,6 +1171,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     await Promise.all(ownershipQueues.values())
     clearInterval(leaseHeartbeat)
     abortController.abort()
+    pendingIdleChecks.clear()
     for (const timer of timers.values()) clearTimeout(timer)
     timers.clear()
     dynamicPending.clear()

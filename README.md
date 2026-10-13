@@ -92,7 +92,7 @@ For manual installation, add the package to both V2 plugin lists.
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint is loaded from `opencode.json`; the sidebar and palette integration are loaded from the global `~/.config/opencode/cli.json`.
 
-V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The dedicated V1 compaction-context hook has no V2 equivalent in this release. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
+V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, and TUI sidebar/palette integration. The plugin does not yet integrate the V2 compaction hook. V2 still injects the active-loop system reminder before model dispatch, but cannot append the separate loop block directly to a compaction operation.
 
 ## Usage
 

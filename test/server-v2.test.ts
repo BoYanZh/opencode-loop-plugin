@@ -80,7 +80,7 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
-  location?: { directory: string; workspaceID?: string }
+  location?: { directory: string; project: { id: string } }
   activeSessions: Set<string>
   unavailableSessions: Set<string>
   promptCalls: Array<{
@@ -99,9 +99,9 @@ type MockContext = {
     transform: (callback: (draft: ToolDraft) => void) => Promise<Registration>
   }
   session: {
-    get: (input: { sessionID: string }) => Promise<{ id: string; location?: { directory: string; workspaceID?: string } }>
+    get: (input: { sessionID: string }) => Promise<{ id: string; projectID?: string; location?: { directory: string } }>
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
-    active: () => Promise<Record<string, { type: "running" }>>
+    wait: (input: { sessionID: string }, options?: { signal?: AbortSignal }) => Promise<void>
     prompt: (input: {
       sessionID: string
       delivery?: "steer" | "queue"
@@ -157,7 +157,9 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
         hooks[name] = callback
         return registration(`session.hook:${name}`)
       },
-      active: async () => Object.fromEntries([...activeSessions].map((sessionID) => [sessionID, { type: "running" as const }])),
+      wait: async ({ sessionID }) => {
+        if (activeSessions.has(sessionID)) throw new Error("session still busy")
+      },
       prompt: async (input) => {
         promptCalls.push(input)
         return { id: "pending_1" }
@@ -375,8 +377,8 @@ test("V2 authoritative session state overrides a stale busy event", async () => 
     contentOf(await loopTool(mock, "create_loop").execute({ instruction: "say tick", interval: "1s" }, toolContext())),
   ) as { created: string }
 
-  // The idle event was lost, but OpenCode's active-session API is authoritative
-  // and no longer lists this session as running.
+  // The idle event was lost, but OpenCode's native idle barrier is authoritative
+  // and now resolves for this session.
   await waitFor(() => mock.promptCalls.length >= 1)
   expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
   await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
@@ -666,12 +668,15 @@ test("V2 keep-alive recovery retains bounded failure pause and explicit resume",
 })
 
 
-test("V2 keep-alive recovery refuses another directory or workspace", async () => {
+test("V2 keep-alive recovery refuses another directory or project", async () => {
   const loop = await createLoop("ses_foreign", { prompt: "tick", intervalMs: 1, keepAlive: true })
-  for (const location of [{ directory: "/other" }, { directory: "/current", workspaceID: "other" }]) {
+  for (const session of [
+    { location: { directory: "/other" }, projectID: "current" },
+    { location: { directory: "/current" }, projectID: "other" },
+  ]) {
     const mock = makeMockContext()
-    mock.location = { directory: "/current" }
-    mock.session.get = async ({ sessionID }) => ({ id: sessionID, location })
+    mock.location = { directory: "/current", project: { id: "current" } }
+    mock.session.get = async ({ sessionID }) => ({ id: sessionID, ...session })
     const cleanup = await plugin.setup(mock as never)
     await sleep(200)
     expect(mock.promptCalls).toHaveLength(0)
@@ -693,4 +698,43 @@ test("V2 concurrent recovery contexts deliver a keep-alive iteration once", asyn
   second.stream.end()
   await cleanFirst()
   await cleanSecond()
+})
+
+
+test("stable V2 recovered keep-alive uses its native idle barrier without active()", async () => {
+  const loop = await createLoop("ses_busy", { prompt: "tick", intervalMs: 100, keepAlive: true, maxRuns: 1 })
+  const mock = makeMockContext()
+  expect(mock.session).not.toHaveProperty("active")
+  mock.activeSessions.add("ses_busy")
+  const cleanup = await plugin.setup(mock as never)
+  await waitFor(async () => (await getLoop(loop.id))?.lastResult === "skipped_busy")
+  expect(mock.promptCalls).toHaveLength(0)
+  mock.activeSessions.delete("ses_busy")
+  await waitFor(async () => (await getLoop(loop.id))?.status === "completed")
+  expect(mock.promptCalls).toHaveLength(1)
+  mock.stream.end()
+  await cleanup()
+})
+
+
+test("V2 bounds native wait even when the stable adapter ignores cancellation", async () => {
+  const loop = await createLoop("ses_wait", { prompt: "tick", intervalMs: 100, keepAlive: true })
+  const mock = makeMockContext()
+  let calls = 0
+  let release!: () => void
+  let nativeFinished = false
+  const pending = new Promise<void>((resolve) => { release = resolve }).then(() => { nativeFinished = true })
+  mock.session.wait = async () => { calls += 1; await pending }
+  const cleanup = await plugin.setup(mock as never)
+  await waitFor(async () => (await getLoop(loop.id))?.lastResult === "skipped_busy")
+  expect(mock.promptCalls).toHaveLength(0)
+  await sleep(200)
+  expect(calls).toBe(1)
+  mock.stream.end()
+  await cleanup()
+  expect(nativeFinished).toBe(false)
+  release()
+  await sleep(50)
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getLoop(loop.id))?.runCount).toBe(0)
 })
