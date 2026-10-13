@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
-import { activeLoops, getLoop, listLoops } from "../src/state"
+import { activeLoops, createLoop, getLoop, listLoops } from "../src/state"
 
 const TOOL_NAMES = [
   "clear_loops",
@@ -80,7 +80,9 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
+  location?: { directory: string; workspaceID?: string }
   activeSessions: Set<string>
+  unavailableSessions: Set<string>
   promptCalls: Array<{
     sessionID: string
     delivery?: "steer" | "queue"
@@ -97,6 +99,7 @@ type MockContext = {
     transform: (callback: (draft: ToolDraft) => void) => Promise<Registration>
   }
   session: {
+    get: (input: { sessionID: string }) => Promise<{ id: string; location?: { directory: string; workspaceID?: string } }>
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
     active: () => Promise<Record<string, { type: "running" }>>
     prompt: (input: {
@@ -114,6 +117,7 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
   const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
   const activeSessions = new Set<string>()
+  const unavailableSessions = new Set<string>()
   const promptCalls: MockContext["promptCalls"] = []
   const disposals: string[] = []
   const stream = controlledStream()
@@ -125,6 +129,7 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
   return {
     options: { min_interval_seconds: 1, busy_backoff_seconds: 1, failure_backoff_seconds: 1, ...options },
     activeSessions,
+    unavailableSessions,
     promptCalls,
     tools,
     commands,
@@ -144,6 +149,10 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
       },
     },
     session: {
+      get: async ({ sessionID }) => {
+        if (unavailableSessions.has(sessionID)) throw new Error("session unavailable")
+        return { id: sessionID }
+      },
       hook: async (name, callback) => {
         hooks[name] = callback
         return registration(`session.hook:${name}`)
@@ -575,4 +584,113 @@ test("V2 slow accepted delivery retains run accounting after its owner lease exp
     mock.stream.end()
     await cleanup()
   }
+})
+
+test("V2 create_loop advertises keep_alive without making it required", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+
+  const input = loopTool(mock, "create_loop").input as {
+    properties: Record<string, { type?: string }>
+    required: string[]
+  }
+  expect(input.properties.keep_alive?.type).toBe("boolean")
+  expect(input.required).toEqual(["instruction"])
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 keep-alive recovery exempts age expiry and preserves ordinary sibling dormancy", async () => {
+  const durable = await createLoop("ses_keep", { prompt: "durable", intervalMs: 1, keepAlive: true })
+  const ordinary = await createLoop("ses_keep", { prompt: "ordinary", intervalMs: 1 })
+  const statePath = process.env.OPENCODE_LOOP_STATE_PATH!
+  const state = JSON.parse(await readFile(statePath, "utf8")) as {
+    loops: Record<string, { createdAt: number; nextRunAt: number }>
+  }
+  for (const loop of Object.values(state.loops)) {
+    loop.createdAt = Date.now() - 400 * 86_400_000
+    loop.nextRunAt = Date.now() - 1000
+  }
+  await writeFile(statePath, JSON.stringify(state))
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect((await getLoop(durable.id))?.status).toBe("active")
+  expect((await getLoop(ordinary.id))?.lastResult).toBeNull()
+  mock.stream.push({ type: "session.idle", data: { sessionID: "ses_keep" } })
+  await waitFor(async () => (await getLoop(ordinary.id))?.status === "stopped")
+  expect((await getLoop(durable.id))?.status).toBe("active")
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 keep_alive requires a fixed interval", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+
+  await expect(
+    loopTool(mock, "create_loop").execute({ instruction: "no cadence", keep_alive: true }, toolContext("ses_bad")),
+  ).rejects.toThrow(/keep-alive loops require a fixed interval/)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+
+test("V2 keep-alive recovery leaves inaccessible sessions dormant", async () => {
+  const loop = await createLoop("ses_missing", { prompt: "tick", intervalMs: 1, keepAlive: true })
+  const mock = makeMockContext()
+  mock.unavailableSessions.add("ses_missing")
+  const cleanup = await plugin.setup(mock as never)
+  await sleep(200)
+  expect(mock.promptCalls).toHaveLength(0)
+  expect((await getLoop(loop.id))?.lastResult).toBeNull()
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 keep-alive recovery retains bounded failure pause and explicit resume", async () => {
+  const loop = await createLoop("ses_retry", { prompt: "tick", intervalMs: 100, keepAlive: true })
+  const mock = makeMockContext({ max_consecutive_failures: 1 })
+  const prompt = mock.session.prompt
+  mock.session.prompt = async () => { throw new Error("provider failed") }
+  const cleanup = await plugin.setup(mock as never)
+  await waitFor(async () => (await getLoop(loop.id))?.status === "paused")
+  mock.session.prompt = prompt
+  await loopTool(mock, "resume_loop").execute({ loop_id: loop.id }, toolContext("ses_retry"))
+  await waitFor(async () => (await getLoop(loop.id))?.runCount === 1)
+  expect((await getLoop(loop.id))?.status).toBe("active")
+  mock.stream.end()
+  await cleanup()
+})
+
+
+test("V2 keep-alive recovery refuses another directory or workspace", async () => {
+  const loop = await createLoop("ses_foreign", { prompt: "tick", intervalMs: 1, keepAlive: true })
+  for (const location of [{ directory: "/other" }, { directory: "/current", workspaceID: "other" }]) {
+    const mock = makeMockContext()
+    mock.location = { directory: "/current" }
+    mock.session.get = async ({ sessionID }) => ({ id: sessionID, location })
+    const cleanup = await plugin.setup(mock as never)
+    await sleep(200)
+    expect(mock.promptCalls).toHaveLength(0)
+    expect((await getLoop(loop.id))?.lastResult).toBeNull()
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 concurrent recovery contexts deliver a keep-alive iteration once", async () => {
+  const loop = await createLoop("ses_shared", { prompt: "tick", intervalMs: 1, keepAlive: true, maxRuns: 1 })
+  const first = makeMockContext()
+  const second = makeMockContext()
+  const cleanFirst = await plugin.setup(first as never)
+  const cleanSecond = await plugin.setup(second as never)
+  await waitFor(async () => (await getLoop(loop.id))?.status === "completed")
+  expect(first.promptCalls.length + second.promptCalls.length).toBe(1)
+  first.stream.end()
+  second.stream.end()
+  await cleanFirst()
+  await cleanSecond()
 })

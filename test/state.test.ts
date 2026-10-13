@@ -328,6 +328,7 @@ test("decodes persisted state with optional fields omitted", async () => {
   expect(loop?.lastResult).toBeNull()
   expect(loop?.maxRuns).toBeNull()
   expect(loop?.agent).toBeNull()
+  expect(loop?.keepAlive).toBe(false)
   expect(loop?.consecutiveFailures).toBe(0)
   expect(loop?.nextRetryAt).toBeNull()
   expect(loop?.blockedReason).toBeNull()
@@ -470,4 +471,18 @@ test("a dynamic iteration counts its run without overwriting an equal-timestamp 
   } finally {
     Date.now = originalNow
   }
+})
+
+test("createLoop records keep-alive futures and defaults them off", async () => {
+  const ordinary = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
+  expect(ordinary.keepAlive).toBe(false)
+
+  const durable = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000, keepAlive: true })
+  expect(durable.keepAlive).toBe(true)
+})
+
+test("keep-alive loops cannot delegate pacing to the agent", async () => {
+  await expect(createLoop("ses_1", { prompt: "tick", mode: "dynamic", keepAlive: true })).rejects.toThrow(
+    /keep-alive loops require a fixed interval/,
+  )
 })

@@ -29,6 +29,7 @@ var LoopSchema = Schema.Struct({
   sessionID: Schema.String,
   prompt: Schema.String,
   mode: Schema.optionalWith(Schema.Literal("interval", "dynamic"), { default: () => "interval" }),
+  keepAlive: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   intervalMs: NullableNumber,
   status: Schema.Literal("active", "paused", "stopped", "completed"),
   createdAt: Schema.Number,
@@ -298,6 +299,9 @@ function requireLoop(state, loopID) {
 async function createLoop(sessionID, options) {
   const prompt = validatePrompt(options.prompt);
   const mode = options.mode === "dynamic" ? "dynamic" : "interval";
+  const keepAlive = options.keepAlive === true;
+  if (keepAlive && mode !== "interval")
+    throw new Error("keep-alive loops require a fixed interval");
   const intervalMs = mode === "interval" ? positiveIntegerOrNull(options.intervalMs) : null;
   if (mode === "interval" && intervalMs == null)
     throw new Error("interval loops require a positive interval");
@@ -318,6 +322,7 @@ async function createLoop(sessionID, options) {
       sessionID,
       prompt,
       mode,
+      keepAlive,
       intervalMs,
       status: "active",
       createdAt: timestamp,
@@ -740,6 +745,7 @@ Preserve each loop's id, cadence, instruction, and status in the compacted conte
 }
 
 // src/server.ts
+var KEEP_ALIVE_DESCRIPTION = "Keep this session scheduled across turns and exempt from age expiry. Requires a fixed interval. Explicit max_runs, session deletion, and the failure-pause threshold still apply. Use it in a background or subagent session whose work outlives the turn that started it: the scheduler keeps re-prompting the session on the cadence, and the loop is never ended automatically by age expiry. You remain responsible for calling stop_loop once the work is resolved or abandoned.";
 var DEFAULT_COMMAND_NAME = "loop";
 var DEFAULT_BUSY_BACKOFF_SECONDS = 60;
 var DEFAULT_FAILURE_BACKOFF_SECONDS = 60;
@@ -818,7 +824,7 @@ async function toolResult(sessionID, extra = {}) {
   const loops = await listLoops(sessionID);
   return JSON.stringify({ ...extra, loops, report: formatLoops(loops) }, null, 2);
 }
-var server = async ({ client }, options) => {
+var server = async ({ client, directory }, options) => {
   const registerCommand = options?.register_command ?? true;
   const commandName = commandNameFromOptions(options);
   const minIntervalSeconds = positiveNumberOr(options?.min_interval_seconds, DEFAULT_MIN_INTERVAL_SECONDS);
@@ -839,6 +845,7 @@ var server = async ({ client }, options) => {
   const ownedSessions = new Map;
   const ownershipQueues = new Map;
   const observedSessions = new Set;
+  const keepAliveSessions = new Set;
   const staleDynamicCandidates = new Map;
   const lastPromptAgentBySession = new Map;
   const dynamicPending = new Map;
@@ -863,11 +870,29 @@ var server = async ({ client }, options) => {
         dynamicPending.delete(loopID);
     }
   }
+  async function recoveredSessionBusy(sessionID) {
+    try {
+      const response = await client.session.status();
+      const status = response.data?.[sessionID];
+      return !response.data || status != null && status.type !== "idle";
+    } catch {
+      return true;
+    }
+  }
+  async function keepAliveSessionAvailable(sessionID) {
+    try {
+      const response = await client.session.get({ path: { id: sessionID } });
+      return response.data?.id === sessionID && (!directory || response.data.directory === directory);
+    } catch {
+      return false;
+    }
+  }
   async function acquireOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
       if (disposed)
         return false;
-      observedSessions.add(sessionID);
+      if (!observedSessions.has(sessionID) && !await keepAliveSessionAvailable(sessionID))
+        return false;
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
       if (!lease) {
         await loseOwnership(sessionID);
@@ -897,7 +922,7 @@ var server = async ({ client }, options) => {
   }
   function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID) || !observedSessions.has(loop.sessionID) && !loop.keepAlive)
       return;
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
@@ -936,7 +961,7 @@ var server = async ({ client }, options) => {
       scheduleTimer(loop);
       return;
     }
-    if (!observedSessions.has(loop.sessionID)) {
+    if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
       scheduleTimer(loop, Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
       await log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
       return;
@@ -950,11 +975,11 @@ var server = async ({ client }, options) => {
       return;
     }
     loop = claimed.loop;
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoopClaimed(loopID, claimed, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
-    if (busySessions.has(loop.sessionID)) {
+    if (busySessions.has(loop.sessionID) || loop.keepAlive && !observedSessions.has(loop.sessionID) && await recoveredSessionBusy(loop.sessionID)) {
       const deferred = await recordRunDeferredClaimed(loopID, claimed, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
       if (deferred)
         scheduleTimer(deferred);
@@ -1050,6 +1075,8 @@ var server = async ({ client }, options) => {
   async function rehydrate() {
     const loops = await activeLoops();
     for (const loop of loops) {
+      if (loop.keepAlive)
+        keepAliveSessions.add(loop.sessionID);
       if (loop.nextRunAt == null) {
         if (loop.mode === "dynamic") {
           staleDynamicCandidates.set(loop.id, { sessionID: loop.sessionID, updatedAt: loop.updatedAt });
@@ -1061,6 +1088,8 @@ var server = async ({ client }, options) => {
         continue;
       }
     }
+    for (const sessionID of keepAliveSessions)
+      await acquireOwnership(sessionID);
   }
   async function observeSession(sessionID) {
     observedSessions.add(sessionID);
@@ -1087,8 +1116,8 @@ var server = async ({ client }, options) => {
   }
   await rehydrate().catch(() => log("error", "Failed to rehydrate loops", { category: "state" }));
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of observedSessions) {
-      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID);
+    for (const sessionID of new Set([...observedSessions, ...keepAliveSessions])) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observedSessions.has(sessionID) ? observeSession(sessionID) : acquireOwnership(sessionID);
       operation.catch(() => log("error", "Loop lease heartbeat failed", { category: "state" }));
     }
   }, SESSION_LEASE_HEARTBEAT_MS);
@@ -1116,7 +1145,8 @@ var server = async ({ client }, options) => {
         args: {
           instruction: z.string().min(1).max(MAX_PROMPT_CHARS).describe("The instruction to perform on each iteration."),
           interval: z.string().optional().describe('Fixed cadence like "30s", "10m", "2h", or "1d". Omit for a dynamically paced loop.'),
-          max_runs: z.number().int().positive().optional().describe("Optional maximum number of iterations before the loop completes.")
+          max_runs: z.number().int().positive().optional().describe("Optional maximum number of iterations before the loop completes."),
+          keep_alive: z.boolean().optional().describe(KEEP_ALIVE_DESCRIPTION)
         },
         async execute(args, context) {
           const input = args;
@@ -1128,7 +1158,8 @@ var server = async ({ client }, options) => {
             intervalMs: dynamic ? null : parseInterval(input.interval, minIntervalSeconds),
             maxRuns: input.max_runs ?? null,
             agent: typeof context.agent === "string" ? context.agent : null,
-            maxLoopsPerSession
+            maxLoopsPerSession,
+            keepAlive: input.keep_alive === true
           });
           if (loop.mode === "dynamic") {
             dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true });
@@ -1343,6 +1374,7 @@ async function setupV2(context) {
   const ownedSessions = new Map;
   const ownershipQueues = new Map;
   const observedSessions = new Set;
+  const keepAliveSessions = new Set;
   const staleDynamicCandidates = new Map;
   const lastPromptAgentBySession = new Map;
   const dynamicPending = new Map;
@@ -1379,11 +1411,21 @@ async function setupV2(context) {
         dynamicPending.delete(loopID);
     }
   }
+  async function keepAliveSessionAvailable(sessionID) {
+    try {
+      const session = await context.session.get({ sessionID });
+      const location = context.location;
+      return session.id === sessionID && (!location || session.location.directory === location.directory && session.location.workspaceID === location.workspaceID);
+    } catch {
+      return false;
+    }
+  }
   async function acquireOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
       if (disposed)
         return false;
-      observedSessions.add(sessionID);
+      if (!observedSessions.has(sessionID) && !await keepAliveSessionAvailable(sessionID))
+        return false;
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
       if (!lease) {
         await loseOwnership(sessionID);
@@ -1413,7 +1455,7 @@ async function setupV2(context) {
   }
   function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID) || !observedSessions.has(loop.sessionID) && !loop.keepAlive)
       return;
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
@@ -1452,7 +1494,7 @@ async function setupV2(context) {
       scheduleTimer(loop);
       return;
     }
-    if (!observedSessions.has(loop.sessionID)) {
+    if (!observedSessions.has(loop.sessionID) && !loop.keepAlive) {
       scheduleTimer(loop, Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
       v2Log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
       return;
@@ -1466,7 +1508,7 @@ async function setupV2(context) {
       return;
     }
     loop = claimed.loop;
-    if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
+    if (!loop.keepAlive && maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
       await stopLoopClaimed(loopID, claimed, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
@@ -1564,6 +1606,8 @@ async function setupV2(context) {
   async function rehydrate() {
     const loops = await activeLoops();
     for (const loop of loops) {
+      if (loop.keepAlive)
+        keepAliveSessions.add(loop.sessionID);
       if (loop.nextRunAt == null) {
         if (loop.mode === "dynamic") {
           staleDynamicCandidates.set(loop.id, { sessionID: loop.sessionID, updatedAt: loop.updatedAt });
@@ -1575,6 +1619,8 @@ async function setupV2(context) {
         continue;
       }
     }
+    for (const sessionID of keepAliveSessions)
+      await acquireOwnership(sessionID);
   }
   async function observeSession(sessionID) {
     observedSessions.add(sessionID);
@@ -1700,8 +1746,8 @@ async function setupV2(context) {
   }));
   await rehydrate().catch(() => v2Log("error", "Failed to rehydrate loops", { category: "state" }));
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of observedSessions) {
-      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID);
+    for (const sessionID of new Set([...observedSessions, ...keepAliveSessions])) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observedSessions.has(sessionID) ? observeSession(sessionID) : acquireOwnership(sessionID);
       operation.catch(() => v2Log("error", "Loop lease heartbeat failed", { category: "state" }));
     }
   }, SESSION_LEASE_HEARTBEAT_MS);
@@ -1762,6 +1808,10 @@ function loopToolsV2(services) {
           type: "integer",
           minimum: 1,
           description: "Optional maximum number of iterations before the loop completes."
+        },
+        keep_alive: {
+          type: "boolean",
+          description: KEEP_ALIVE_DESCRIPTION
         }
       }, ["instruction"]),
       options: { codemode: false },
@@ -1775,7 +1825,8 @@ function loopToolsV2(services) {
           intervalMs: dynamic ? null : parseInterval(input.interval, services.minIntervalSeconds),
           maxRuns: input.max_runs ?? null,
           agent: typeof toolContext.agent === "string" ? toolContext.agent : null,
-          maxLoopsPerSession: services.maxLoopsPerSession
+          maxLoopsPerSession: services.maxLoopsPerSession,
+          keepAlive: input.keep_alive === true
         });
         if (loop.mode === "dynamic") {
           services.dynamicPending.set(loop.id, { sessionID: loop.sessionID, sawBusy: true });

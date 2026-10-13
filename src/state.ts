@@ -22,6 +22,7 @@ export type CreateLoopOptions = {
   maxRuns?: number | null
   agent?: string | null
   maxLoopsPerSession?: number | null
+  keepAlive?: boolean
 }
 
 export type Loop = {
@@ -29,6 +30,7 @@ export type Loop = {
   sessionID: string
   prompt: string
   mode: LoopMode
+  keepAlive: boolean
   intervalMs: number | null
   status: LoopStatus
   createdAt: number
@@ -85,6 +87,7 @@ const LoopSchema = Schema.Struct({
   sessionID: Schema.String,
   prompt: Schema.String,
   mode: Schema.optionalWith(Schema.Literal("interval", "dynamic"), { default: () => "interval" as const }),
+  keepAlive: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   intervalMs: NullableNumber,
   status: Schema.Literal("active", "paused", "stopped", "completed"),
   createdAt: Schema.Number,
@@ -393,6 +396,11 @@ function requireLoop(state: State, loopID: string) {
 export async function createLoop(sessionID: string, options: CreateLoopOptions) {
   const prompt = validatePrompt(options.prompt)
   const mode: LoopMode = options.mode === "dynamic" ? "dynamic" : "interval"
+  const keepAlive = options.keepAlive === true
+  // A keep-alive future needs a self-sufficient heartbeat. Dynamic pacing puts
+  // the next run in the agent's hands every turn, so one missed reschedule
+  // would end the very future the flag promises to hold open.
+  if (keepAlive && mode !== "interval") throw new Error("keep-alive loops require a fixed interval")
   const intervalMs = mode === "interval" ? positiveIntegerOrNull(options.intervalMs) : null
   if (mode === "interval" && intervalMs == null) throw new Error("interval loops require a positive interval")
   const maxRuns = positiveIntegerOrNull(options.maxRuns)
@@ -411,6 +419,7 @@ export async function createLoop(sessionID: string, options: CreateLoopOptions) 
       sessionID,
       prompt,
       mode,
+      keepAlive,
       intervalMs,
       status: "active",
       createdAt: timestamp,
