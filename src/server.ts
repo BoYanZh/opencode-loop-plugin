@@ -52,6 +52,8 @@ type Options = {
   restricted_agents?: string[]
 }
 
+type PendingDynamicTurn = { sessionID: string; sawBusy: boolean }
+
 const KEEP_ALIVE_DESCRIPTION =
   "Keep this session scheduled across turns and exempt from age expiry. Requires a fixed interval. Explicit max_runs, session deletion, and the failure-pause threshold still apply. Use it in a background or subagent session whose work outlives the turn that started it: the scheduler keeps re-prompting the session on the cadence, and the loop is never ended automatically by age expiry. You remain responsible for calling stop_loop once the work is resolved or abandoned."
 
@@ -173,7 +175,7 @@ const server: Plugin = async ({ client, directory }, options?: Options) => {
   const lastPromptAgentBySession = new Map<string, string>()
   // Dynamic loops whose latest injected (or creating) turn has not yet gone idle:
   // if that turn ends without schedule_next_run or stop_loop, the loop ends.
-  const dynamicPending = new Map<string, { sessionID: string; sawBusy: boolean }>()
+  const dynamicPending = new Map<string, PendingDynamicTurn>()
 
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
@@ -706,7 +708,7 @@ type LoopServices = {
   dynamicMaxDelaySeconds: number
   observedSessions: Set<string>
   observeSession: (sessionID: string) => Promise<void>
-  dynamicPending: Map<string, { sessionID: string; sawBusy: boolean }>
+  dynamicPending: Map<string, PendingDynamicTurn>
   scheduleTimer: (loop: LoopSnapshot) => void
   cancelTimer: (loopID: string) => void
   requireSessionLoop: (loopID: string, sessionID: string) => Promise<LoopSnapshot>
@@ -747,8 +749,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const lastPromptAgentBySession = new Map<string, string>()
   // Dynamic loops whose latest injected (or creating) turn has not yet gone idle:
   // if that turn ends without schedule_next_run or stop_loop, the loop ends.
-  const dynamicPending = new Map<string, { sessionID: string; sawBusy: boolean }>()
+  const dynamicPending = new Map<string, PendingDynamicTurn>()
   const registrations: Array<{ dispose(): Promise<void> }> = []
+  // A terminal event may precede delivery accounting. Retain the exact turn
+  // so replaying that event cannot settle a newer iteration or a sibling.
+  const deferredDynamicSettlements = new Map<string, PendingDynamicTurn>()
+  const shuttingDownSessions = new Set<string>()
 
   const isRestrictedAgent = (agent: string | null | undefined) =>
     typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase())
@@ -845,6 +851,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   function scheduleTimer(loop: LoopSnapshot, minimumDelayMs = 0) {
     cancelTimer(loop.id)
     if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID) ||
+      shuttingDownSessions.has(loop.sessionID) ||
       (!observedSessions.has(loop.sessionID) && !loop.keepAlive)) return
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now())
     const timer = setTimeout(() => {
@@ -865,12 +872,19 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       v2Log("error", "Loop scheduler operation failed", { loopID, category: "scheduler" })
     } finally {
       sendingLoops.delete(loopID)
+      const pending = deferredDynamicSettlements.get(loopID)
+      deferredDynamicSettlements.delete(loopID)
+      if (pending && dynamicPending.get(loopID) === pending && !disposed) {
+        await settleDynamicLoop(loopID, pending).catch(() =>
+          v2Log("error", "Dynamic loop settlement failed", { loopID, category: "scheduler" }),
+        )
+      }
     }
   }
 
   async function runDueLocked(loopID: string) {
     let loop = await getLoop(loopID)
-    if (!loop || loop.status !== "active" || loop.nextRunAt == null) return
+    if (!loop || loop.status !== "active" || loop.nextRunAt == null || shuttingDownSessions.has(loop.sessionID)) return
     if (!(await renewOwnership(loop.sessionID))) return
     const lease = ownedSessions.get(loop.sessionID)
     if (!lease || !(await ownsSessionLease(loop.sessionID, instanceID, lease.revision))) {
@@ -923,7 +937,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false })
     }
-    if (disposed || !(await confirmRunClaim(loopID, claimed))) {
+    if (disposed || shuttingDownSessions.has(loop.sessionID) || !(await confirmRunClaim(loopID, claimed))) {
       dynamicPending.delete(loopID)
       const current = await getLoop(loopID)
       if (current) scheduleTimer(current)
@@ -968,6 +982,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   async function runDueForSession(sessionID: string) {
+    if (shuttingDownSessions.has(sessionID)) return
     const loops = await activeLoops(sessionID)
     const now = Date.now()
     for (const loop of loops) {
@@ -978,19 +993,25 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }
   }
 
+  async function settleDynamicLoop(loopID: string, pending: PendingDynamicTurn) {
+    const lease = ownedSessions.get(pending.sessionID)
+    if (!lease || dynamicPending.get(loopID) !== pending || !pending.sawBusy) return
+    if (sendingLoops.has(loopID)) {
+      deferredDynamicSettlements.set(loopID, pending)
+      return
+    }
+    dynamicPending.delete(loopID)
+    const loop = await getLoop(loopID)
+    if (!loop || loop.status !== "active" || loop.mode !== "dynamic" || loop.nextRunAt != null) return
+    await stopLoopIfUnchanged(
+      loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease,
+    ).catch(() => undefined)
+    v2Log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID })
+  }
+
   async function settleDynamicLoops(sessionID: string) {
-    const lease = ownedSessions.get(sessionID)
-    if (!lease) return
     for (const [loopID, pending] of dynamicPending) {
-      if (pending.sessionID !== sessionID || !pending.sawBusy) continue
-      dynamicPending.delete(loopID)
-      const loop = await getLoop(loopID)
-      if (!loop || loop.status !== "active" || loop.mode !== "dynamic") continue
-      if (loop.nextRunAt != null) continue
-      await stopLoopIfUnchanged(
-        loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease,
-      ).catch(() => undefined)
-      v2Log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID })
+      if (pending.sessionID === sessionID) await settleDynamicLoop(loopID, pending)
     }
   }
 
@@ -1034,20 +1055,36 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     return loop
   }
 
+  function markExecutionStarted(sessionID: string) {
+    busySessions.add(sessionID)
+    for (const pending of dynamicPending.values()) {
+      if (pending.sessionID === sessionID) pending.sawBusy = true
+    }
+  }
+
   async function handleV2Event(event: V2EventLike) {
     const data = event.data
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
     if (!sessionID) return
+    if (event.type === "session.execution.interrupted" && data.reason === "shutdown") {
+      // Do this before observation can acquire a lease and arm due timers.
+      shuttingDownSessions.add(sessionID)
+      for (const loop of await activeLoops(sessionID)) cancelTimer(loop.id)
+      await settleDynamicLoops(sessionID)
+      return
+    }
+    if (event.type === "session.execution.started") shuttingDownSessions.delete(sessionID)
     await observeSession(sessionID)
     switch (event.type) {
+      case "session.execution.started": {
+        markExecutionStarted(sessionID)
+        return
+      }
       case "session.status": {
         const status = data.status
         if (isRecord(status) && typeof status.type === "string") {
           if (status.type === "busy") {
-            busySessions.add(sessionID)
-            for (const pending of dynamicPending.values()) {
-              if (pending.sessionID === sessionID) pending.sawBusy = true
-            }
+            markExecutionStarted(sessionID)
           }
           if (status.type === "idle") {
             busySessions.delete(sessionID)
@@ -1057,6 +1094,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         }
         return
       }
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.execution.interrupted":
       case "session.idle": {
         busySessions.delete(sessionID)
         await settleDynamicLoops(sessionID)
@@ -1175,6 +1215,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     for (const timer of timers.values()) clearTimeout(timer)
     timers.clear()
     dynamicPending.clear()
+    deferredDynamicSettlements.clear()
+    shuttingDownSessions.clear()
     sendingLoops.clear()
     await Promise.all(
       [...ownedSessions.values()].map((lease) => releaseSessionLease(lease.sessionID, instanceID, lease.revision)),

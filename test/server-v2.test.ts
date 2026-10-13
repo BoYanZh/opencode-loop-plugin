@@ -52,7 +52,9 @@ function controlledStream() {
   const queue: Array<{ done: boolean; value?: unknown }> = []
   const waiters: Array<() => void> = []
   let ended = false
+  let processed = 0
   return {
+    get processed() { return processed },
     push(value: unknown) {
       if (ended) return
       queue.push({ done: false, value })
@@ -70,6 +72,7 @@ function controlledStream() {
         if (item) {
           if (item.done) return
           yield item.value
+          processed += 1
           continue
         }
         await new Promise<void>((resolve) => waiters.push(resolve))
@@ -422,6 +425,220 @@ test("V2 dynamic loops settle when the turn does not schedule the next run", asy
 
   mock.stream.end()
   await cleanup()
+})
+
+test("V2 native execution completion closes an unscheduled dynamic creating turn", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "watch CI" }, toolContext(),
+    ))) as { created: string }
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 native execution completion closes an unscheduled injected dynamic turn", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "watch CI" }, toolContext(),
+    ))) as { created: string }
+    await loopTool(mock, "schedule_next_run").execute({ loop_id: created.created, delay_seconds: 1 }, toolContext())
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+for (const outcome of ["failed", "interrupted"] as const) {
+  test(`V2 native execution ${outcome} closes an unscheduled dynamic turn`, async () => {
+    const mock = makeMockContext()
+    const cleanup = await plugin.setup(mock as never)
+    try {
+      const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+        { instruction: "watch CI" }, toolContext(),
+      ))) as { created: string }
+      mock.stream.push({ type: `session.execution.${outcome}`, created: Date.now(), data: { sessionID: "ses_v2", reason: "user" } })
+      await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+    } finally {
+      mock.stream.end()
+      await cleanup()
+    }
+  })
+}
+
+test("V2 fixed loops honor the native idle barrier across two execution transitions", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "tick", interval: "1s", max_runs: 2 }, toolContext(),
+    ))) as { created: string }
+    await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+    mock.activeSessions.add("ses_v2")
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_busy")
+    expect(mock.promptCalls).toHaveLength(1)
+    mock.activeSessions.delete("ses_v2")
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "completed")
+    expect(mock.promptCalls).toHaveLength(2)
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 native completion arriving before delivery accounting still closes a dynamic turn", async () => {
+  const mock = makeMockContext()
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: input.sessionID } })
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: input.sessionID } })
+    await waitFor(() => mock.stream.processed >= processed + 2)
+    return { id: "pending_fast" }
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "watch CI" }, toolContext(),
+    ))) as { created: string }
+    await loopTool(mock, "schedule_next_run").execute({ loop_id: created.created, delay_seconds: 1 }, toolContext())
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+    expect((await getLoop(created.created))?.runCount).toBe(1)
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 fast native completion preserves an explicit next dynamic schedule", async () => {
+  const mock = makeMockContext()
+  let loopID = ""
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: input.sessionID } })
+    await loopTool(mock, "schedule_next_run").execute({ loop_id: loopID, delay_seconds: 60 }, toolContext())
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: input.sessionID } })
+    await waitFor(() => mock.stream.processed >= processed + 2)
+    return { id: "pending_rescheduled" }
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "watch CI" }, toolContext(),
+    ))) as { created: string }
+    loopID = created.created
+    await loopTool(mock, "schedule_next_run").execute({ loop_id: loopID, delay_seconds: 1 }, toolContext())
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(loopID))?.runCount === 1)
+    const loop = await getLoop(loopID)
+    expect(loop?.status).toBe("active")
+    expect(loop?.nextRunAt).toBeGreaterThan(Date.now() + 50_000)
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 a deferred creating-turn completion cannot close a newly injected turn", async () => {
+  const mock = makeMockContext()
+  let releaseWait: () => void = () => {}
+  let waitEntered = false
+  mock.session.wait = async () => {
+    waitEntered = true
+    await new Promise<void>((resolve) => { releaseWait = resolve })
+  }
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.execution.started", created: Date.now(), data: { sessionID: input.sessionID } })
+    await waitFor(() => mock.stream.processed > processed)
+    return { id: "pending_next_turn" }
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "watch CI" }, toolContext(),
+    ))) as { created: string }
+    await loopTool(mock, "run_loop").execute({ loop_id: created.created }, toolContext())
+    await waitFor(() => waitEntered)
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(() => mock.stream.processed > processed)
+    releaseWait()
+    await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
+    expect((await getLoop(created.created))?.status).toBe("active")
+    mock.stream.push({ type: "session.execution.succeeded", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await waitFor(async () => (await getLoop(created.created))?.status === "stopped")
+  } finally {
+    releaseWait()
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 shutdown preserves a due interval loop without injecting into a draining host", async () => {
+  const loop = await createLoop("ses_v2", { prompt: "tick", intervalMs: 1 })
+  const mock = makeMockContext({ max_consecutive_failures: 1 })
+  mock.session.prompt = async (input) => {
+    mock.promptCalls.push(input)
+    throw new Error("host shutting down")
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    mock.stream.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "ses_v2", reason: "shutdown" } })
+    await sleep(200)
+    expect(mock.promptCalls).toHaveLength(0)
+    expect((await getLoop(loop.id))?.status).toBe("active")
+    expect((await getLoop(loop.id))?.consecutiveFailures).toBe(0)
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test("V2 shutdown fences an iteration already waiting for native idle", async () => {
+  const mock = makeMockContext()
+  let releaseWait: () => void = () => {}
+  let waitEntered = false
+  mock.session.wait = async () => {
+    waitEntered = true
+    await new Promise<void>((resolve) => { releaseWait = resolve })
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "tick", interval: "1s" }, toolContext(),
+    ))) as { created: string }
+    await waitFor(() => waitEntered)
+    const processed = mock.stream.processed
+    mock.stream.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "ses_v2", reason: "shutdown" } })
+    await waitFor(() => mock.stream.processed > processed)
+    releaseWait()
+    await sleep(150)
+    expect(mock.promptCalls).toHaveLength(0)
+    expect((await getLoop(created.created))?.status).toBe("active")
+    expect((await getLoop(created.created))?.consecutiveFailures).toBe(0)
+  } finally {
+    releaseWait()
+    mock.stream.end()
+    await cleanup()
+  }
 })
 
 test("V2 restricted agents defer loop iterations", async () => {
