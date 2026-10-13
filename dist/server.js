@@ -1,10 +1,11 @@
 // @bun
 // src/server.ts
-import { randomUUID } from "crypto";
+import { randomUUID as randomUUID2 } from "crypto";
 import { z } from "zod";
 
 // src/state.ts
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
+import { randomUUID } from "crypto";
+import { chmod, mkdir, link, readFile, rename, rm, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { Data, Effect, Schema } from "effect";
@@ -133,37 +134,72 @@ async function readRawState() {
     throw error;
   }
 }
-var LOCK_STALE_MS = 30000;
+var LOCK_WAIT_MS = 30000;
 var LOCK_RETRY_MS = 10;
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+async function acquireProcessLock(lock, deadline) {
+  const token = `${process.pid}-${randomUUID()}`;
+  const ownerPath = `${lock}.owner.${token}`;
+  await writeFile(ownerPath, token, { mode: 384, flag: "wx" });
+  let acquired = false;
+  try {
+    for (;; ) {
+      try {
+        await link(ownerPath, lock);
+        acquired = true;
+        return async () => {
+          try {
+            if (await readFile(lock, "utf8").catch(() => null) === token)
+              await rm(lock, { force: true });
+          } finally {
+            await rm(ownerPath, { force: true });
+          }
+        };
+      } catch (error) {
+        if (error.code !== "EEXIST")
+          throw error;
+        try {
+          const owner = await readFile(lock, "utf8");
+          const pid = Number(owner.split("-", 1)[0]);
+          if (/^\d+-[0-9a-f-]{36}$/.test(owner) && !processIsAlive(pid)) {
+            const release = await acquireProcessLock(`${lock}.reclaim.${owner}`, deadline);
+            try {
+              if (await readFile(lock, "utf8").catch(() => null) === owner) {
+                await rm(lock, { force: true });
+                await rm(`${lock}.owner.${owner}`, { force: true });
+              }
+            } finally {
+              await release();
+            }
+          }
+        } catch (lockError) {
+          if (!isMissingStateFile(lockError))
+            throw lockError;
+        }
+        if (Date.now() >= deadline)
+          throw new Error("timed out waiting for the loop state lock", { cause: error });
+        await sleep(LOCK_RETRY_MS);
+      }
+    }
+  } finally {
+    if (!acquired)
+      await rm(ownerPath, { force: true });
+  }
+}
 async function acquireMutationLock() {
   const file = statePath();
-  const lock = `${file}.lock`;
   await mkdir(dirname(file), { recursive: true, mode: 448 });
-  for (;; ) {
-    try {
-      await mkdir(lock, { mode: 448 });
-      return async () => rm(lock, { recursive: true, force: true });
-    } catch (error) {
-      if (error.code !== "EEXIST")
-        throw error;
-      try {
-        const lockStat = await stat(lock);
-        if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
-          const stale = `${lock}.stale.${process.pid}.${Date.now()}`;
-          await rename(lock, stale);
-          await rm(stale, { recursive: true, force: true });
-          continue;
-        }
-      } catch (lockError) {
-        if (!isMissingStateFile(lockError))
-          throw lockError;
-      }
-      await sleep(LOCK_RETRY_MS);
-    }
-  }
+  return acquireProcessLock(`${file}.lock`, Date.now() + LOCK_WAIT_MS);
 }
 async function mutate(fn) {
   return enqueueMutation(async () => {
@@ -268,7 +304,7 @@ async function createLoop(sessionID, options) {
   const maxLoops = positiveIntegerOrNull(options.maxLoopsPerSession) ?? DEFAULT_MAX_LOOPS_PER_SESSION;
   const agent = typeof options.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   return mutate((state) => {
-    const open = Object.values(state.loops).filter((loop) => loop.sessionID === sessionID && isOpen(loop.status));
+    const open = Object.values(state.loops).filter((loop2) => loop2.sessionID === sessionID && isOpen(loop2.status));
     if (open.length >= maxLoops) {
       throw new Error(`this session already has ${open.length} open loop(s); stop one before creating another (limit ${maxLoops})`);
     }
@@ -328,7 +364,7 @@ async function acquireSessionLease(sessionID, instanceID, leaseMs) {
       sessionID,
       instanceID,
       expiresAt: timestamp + duration,
-      revision: (current?.revision ?? 0) + 1
+      revision: current?.instanceID === instanceID && current.expiresAt > timestamp ? current.revision : (current?.revision ?? 0) + 1
     };
     state.sessionLeases[sessionID] = lease;
     return { ...lease };
@@ -342,7 +378,6 @@ async function renewSessionLease(sessionID, instanceID, revision, leaseMs) {
     if (!current || current.instanceID !== instanceID || current.revision !== revision || current.expiresAt <= timestamp)
       return null;
     current.expiresAt = timestamp + duration;
-    current.revision += 1;
     return { ...current };
   });
 }
@@ -356,11 +391,11 @@ async function releaseSessionLease(sessionID, instanceID, revision) {
     const current = state.sessionLeases[sessionID];
     if (!current || current.instanceID !== instanceID || current.revision !== revision)
       return false;
-    delete state.sessionLeases[sessionID];
+    current.expiresAt = 0;
     return true;
   });
 }
-async function acquireLoopOwner(loopID, ownerID, leaseMs) {
+async function acquireLoopOwner(loopID, ownerID, leaseMs, sessionLease) {
   const lease = positiveIntegerOrNull(Math.round(leaseMs));
   if (!ownerID.trim())
     throw new Error("loop owner id must not be empty");
@@ -369,7 +404,7 @@ async function acquireLoopOwner(loopID, ownerID, leaseMs) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
     const timestamp = now();
-    if (loop.status !== "active")
+    if (loop.status !== "active" || sessionLease && !matchesSessionLease(state, sessionLease, timestamp))
       return null;
     if (loop.ownerID !== ownerID && loop.ownerLeaseUntil != null && loop.ownerLeaseUntil > timestamp)
       return null;
@@ -378,7 +413,7 @@ async function acquireLoopOwner(loopID, ownerID, leaseMs) {
     loop.ownerID = ownerID;
     loop.ownerLeaseUntil = timestamp + lease;
     loop.updatedAt = timestamp;
-    return { ownerID, ownerRevision: loop.ownerRevision };
+    return { ownerID, ownerRevision: loop.ownerRevision, ...sessionLease ? { sessionLease } : {} };
   });
 }
 async function claimDueRunOwned(loopID, owner, leaseMs) {
@@ -388,7 +423,7 @@ async function claimDueRunOwned(loopID, owner, leaseMs) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
     const timestamp = now();
-    if (!matchesOwner(loop, owner, timestamp))
+    if (!matchesOwner(loop, owner, state, timestamp))
       return null;
     if (loop.status !== "active" || loop.nextRunAt == null || loop.nextRunAt > timestamp)
       return null;
@@ -398,16 +433,20 @@ async function claimDueRunOwned(loopID, owner, leaseMs) {
     return { ...owner, claimToken: loop.runClaimToken, loop: snapshot(loop) };
   });
 }
-function matchesOwner(loop, owner, timestamp = now()) {
-  return loop.ownerID === owner.ownerID && loop.ownerRevision === owner.ownerRevision && (loop.ownerLeaseUntil ?? 0) > timestamp;
+function matchesSessionLease(state, expected, timestamp = now()) {
+  const current = state.sessionLeases[expected.sessionID];
+  return current != null && current.instanceID === expected.instanceID && current.revision === expected.revision && current.expiresAt > timestamp;
 }
-function matchesClaim(loop, claim, timestamp = now()) {
-  return matchesOwner(loop, claim, timestamp) && loop.runClaimToken === claim.claimToken;
+function matchesOwner(loop, owner, state, timestamp = now()) {
+  return loop.ownerID === owner.ownerID && loop.ownerRevision === owner.ownerRevision && (loop.ownerLeaseUntil ?? 0) > timestamp && (!owner.sessionLease || owner.sessionLease.sessionID === loop.sessionID && matchesSessionLease(state, owner.sessionLease, timestamp));
+}
+function matchesClaim(loop, claim, state, timestamp = now()) {
+  return matchesOwner(loop, claim, state, timestamp) && loop.runClaimToken === claim.claimToken;
 }
 async function confirmRunClaim(loopID, claim) {
   const state = await readState();
   const loop = state.loops[loopID];
-  return loop != null && matchesClaim(loop, claim) ? snapshot(loop) : null;
+  return loop != null && loop.status === "active" && loop.nextRunAt === claim.loop.nextRunAt && matchesClaim(loop, claim, state) ? snapshot(loop) : null;
 }
 async function listLoops(sessionID) {
   const state = await readState();
@@ -427,6 +466,7 @@ async function pauseLoop(loopID) {
     if (loop.status !== "active")
       throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be paused`);
     loop.status = "paused";
+    loop.runClaimToken += 1;
     loop.nextRunAt = null;
     loop.nextRetryAt = null;
     loop.stopReason = "paused";
@@ -441,6 +481,7 @@ async function resumeLoop(loopID) {
       throw new Error(`loop "${loopID}" is ${loop.status}; only paused loops can be resumed`);
     const timestamp = now();
     loop.status = "active";
+    loop.runClaimToken += 1;
     loop.stopReason = null;
     loop.blockedReason = null;
     loop.consecutiveFailures = 0;
@@ -463,10 +504,10 @@ async function stopLoop(loopID, reason) {
     return snapshot(loop);
   });
 }
-async function stopLoopIfUnchanged(loopID, expectedUpdatedAt, reason) {
+async function stopLoopIfUnchanged(loopID, expectedUpdatedAt, reason, sessionLease) {
   return mutate((state) => {
     const loop = state.loops[loopID];
-    if (!loop)
+    if (!loop || sessionLease && !matchesSessionLease(state, sessionLease))
       return null;
     if (loop.updatedAt !== expectedUpdatedAt || loop.status !== "active" || loop.mode !== "dynamic" || loop.nextRunAt != null) {
       return null;
@@ -524,8 +565,9 @@ async function scheduleNextRun(loopID, delayMs, reason) {
 async function recordRunSentClaimed(loopID, claim) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (!matchesClaim(loop, claim) || loop.status !== "active")
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active")
       return null;
+    const rescheduled = loop.nextRunAt !== claim.loop.nextRunAt;
     const timestamp = now();
     loop.runCount += 1;
     loop.lastRunAt = timestamp;
@@ -539,17 +581,15 @@ async function recordRunSentClaimed(loopID, claim) {
       loop.status = "completed";
       loop.nextRunAt = null;
       loop.stopReason = `max runs reached (${loop.maxRuns})`;
-    } else if (loop.mode === "interval")
-      loop.nextRunAt = timestamp + loop.intervalMs;
-    else
-      loop.nextRunAt = null;
+    } else if (!rescheduled)
+      loop.nextRunAt = loop.mode === "interval" ? timestamp + loop.intervalMs : null;
     return snapshot(loop);
   });
 }
 async function recordRunFailedClaimed(loopID, claim, _error, retryDelayMs, maxConsecutiveFailures = 5, maxRetryDelayMs = 60 * 60 * 1000) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (!matchesClaim(loop, claim) || loop.status !== "active")
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active")
       return null;
     const timestamp = now();
     loop.lastResult = "failed";
@@ -564,7 +604,7 @@ async function recordRunFailedClaimed(loopID, claim, _error, retryDelayMs, maxCo
       loop.stopReason = loop.blockedReason;
     } else {
       const baseDelay = Math.max(1, Math.round(retryDelayMs));
-      const cap = Math.max(baseDelay, Math.round(maxRetryDelayMs));
+      const cap = Math.max(1, Math.round(maxRetryDelayMs));
       const delay = Math.min(cap, baseDelay * 2 ** (loop.consecutiveFailures - 1));
       loop.nextRetryAt = timestamp + delay;
       loop.nextRunAt = loop.nextRetryAt;
@@ -576,7 +616,7 @@ async function recordRunFailedClaimed(loopID, claim, _error, retryDelayMs, maxCo
 async function recordRunDeferredClaimed(loopID, claim, result, retryDelayMs) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (!matchesClaim(loop, claim) || loop.status !== "active")
+    if (!matchesClaim(loop, claim, state) || loop.status !== "active")
       return null;
     const timestamp = now();
     loop.lastResult = result;
@@ -589,7 +629,7 @@ async function recordRunDeferredClaimed(loopID, claim, result, retryDelayMs) {
 async function stopLoopClaimed(loopID, claim, reason) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (!matchesClaim(loop, claim) || !isOpen(loop.status))
+    if (!matchesClaim(loop, claim, state) || !isOpen(loop.status))
       return null;
     loop.status = "stopped";
     loop.nextRunAt = null;
@@ -787,11 +827,12 @@ var server = async ({ client }, options) => {
   const maxLoopAgeMs = nonNegativeNumberOr(options?.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options?.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
+  let disposed = false;
   const timers = new Map;
   const sendingLoops = new Set;
   const busySessions = new Set;
-  const instanceID = randomUUID();
-  const loopOwnerID = `server:${process.pid}:${randomUUID()}`;
+  const instanceID = randomUUID2();
+  const loopOwnerID = `server:${process.pid}:${randomUUID2()}`;
   const ownedSessions = new Map;
   const ownershipQueues = new Map;
   const observedSessions = new Set;
@@ -821,6 +862,8 @@ var server = async ({ client }, options) => {
   }
   async function acquireOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed)
+        return false;
       observedSessions.add(sessionID);
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
       if (!lease) {
@@ -835,6 +878,8 @@ var server = async ({ client }, options) => {
   }
   async function renewOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed)
+        return false;
       const lease = ownedSessions.get(sessionID);
       if (!lease)
         return false;
@@ -849,7 +894,7 @@ var server = async ({ client }, options) => {
   }
   function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
       return;
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
@@ -893,7 +938,7 @@ var server = async ({ client }, options) => {
       await log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
       return;
     }
-    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS);
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
     const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null;
     if (!claimed) {
       loop = await getLoop(loopID);
@@ -926,7 +971,7 @@ var server = async ({ client }, options) => {
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false });
     }
-    if (!await confirmRunClaim(loopID, claimed)) {
+    if (disposed || !await confirmRunClaim(loopID, claimed)) {
       dynamicPending.delete(loopID);
       const current = await getLoop(loopID);
       if (current)
@@ -943,6 +988,7 @@ var server = async ({ client }, options) => {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
+      await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
       const failed = await recordRunFailedClaimed(loopID, claimed, error instanceof Error ? error.message : String(error), failureBackoffMs, maxConsecutiveFailures, maxFailureBackoffMs);
       if (failed)
         scheduleTimer(failed);
@@ -956,18 +1002,23 @@ var server = async ({ client }, options) => {
     }
     busySessions.add(loop.sessionID);
     observedSessions.add(loop.sessionID);
+    await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
     const sent = await recordRunSentClaimed(loopID, claimed);
-    if (!sent)
+    if (!sent) {
+      const current = await getLoop(loopID);
+      if (current)
+        scheduleTimer(current);
       return;
+    }
     if (sent.mode !== "dynamic" || sent.status !== "active")
       dynamicPending.delete(loopID);
     scheduleTimer(sent);
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now = Date.now();
+    const now2 = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now)
+      if (loop.nextRunAt == null || loop.nextRunAt > now2)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -975,6 +1026,9 @@ var server = async ({ client }, options) => {
     }
   }
   async function settleDynamicLoops(sessionID) {
+    const lease = ownedSessions.get(sessionID);
+    if (!lease)
+      return;
     for (const [loopID, pending] of dynamicPending) {
       if (pending.sessionID !== sessionID || !pending.sawBusy)
         continue;
@@ -984,7 +1038,7 @@ var server = async ({ client }, options) => {
         continue;
       if (loop.nextRunAt != null)
         continue;
-      await stopLoop(loopID, "the iteration ended without scheduling the next run").catch(() => {
+      await stopLoopIfUnchanged(loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease).catch(() => {
         return;
       });
       await log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID });
@@ -1009,11 +1063,14 @@ var server = async ({ client }, options) => {
     observedSessions.add(sessionID);
     if (!await acquireOwnership(sessionID))
       return;
+    const lease = ownedSessions.get(sessionID);
+    if (!lease)
+      return;
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID)
         continue;
       staleDynamicCandidates.delete(loopID);
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted");
+      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
@@ -1027,12 +1084,16 @@ var server = async ({ client }, options) => {
   }
   await rehydrate().catch(() => log("error", "Failed to rehydrate loops", { category: "state" }));
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of ownedSessions.keys())
-      renewOwnership(sessionID);
+    for (const sessionID of observedSessions) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID);
+      operation.catch(() => log("error", "Loop lease heartbeat failed", { category: "state" }));
+    }
   }, SESSION_LEASE_HEARTBEAT_MS);
   leaseHeartbeat.unref?.();
   return {
     async dispose() {
+      disposed = true;
+      await Promise.all(ownershipQueues.values());
       clearInterval(leaseHeartbeat);
       for (const timer of timers.values())
         clearTimeout(timer);
@@ -1270,11 +1331,12 @@ async function setupV2(context) {
   const maxLoopAgeMs = nonNegativeNumberOr(options.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
+  let disposed = false;
   const timers = new Map;
   const sendingLoops = new Set;
   const busySessions = new Set;
-  const instanceID = randomUUID();
-  const loopOwnerID = `server-v2:${process.pid}:${randomUUID()}`;
+  const instanceID = randomUUID2();
+  const loopOwnerID = `server-v2:${process.pid}:${randomUUID2()}`;
   const ownedSessions = new Map;
   const ownershipQueues = new Map;
   const observedSessions = new Set;
@@ -1316,6 +1378,8 @@ async function setupV2(context) {
   }
   async function acquireOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed)
+        return false;
       observedSessions.add(sessionID);
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
       if (!lease) {
@@ -1330,6 +1394,8 @@ async function setupV2(context) {
   }
   async function renewOwnership(sessionID) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed)
+        return false;
       const lease = ownedSessions.get(sessionID);
       if (!lease)
         return false;
@@ -1344,7 +1410,7 @@ async function setupV2(context) {
   }
   function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
       return;
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
@@ -1388,7 +1454,7 @@ async function setupV2(context) {
       v2Log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
       return;
     }
-    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS);
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
     const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null;
     if (!claimed) {
       loop = await getLoop(loopID);
@@ -1421,7 +1487,7 @@ async function setupV2(context) {
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false });
     }
-    if (!await confirmRunClaim(loopID, claimed)) {
+    if (disposed || !await confirmRunClaim(loopID, claimed)) {
       dynamicPending.delete(loopID);
       const current = await getLoop(loopID);
       if (current)
@@ -1436,6 +1502,7 @@ async function setupV2(context) {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
+      await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
       const failed = await recordRunFailedClaimed(loopID, claimed, error instanceof Error ? error.message : String(error), failureBackoffMs, maxConsecutiveFailures, maxFailureBackoffMs);
       if (failed)
         scheduleTimer(failed);
@@ -1449,18 +1516,23 @@ async function setupV2(context) {
     }
     busySessions.add(loop.sessionID);
     observedSessions.add(loop.sessionID);
+    await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease);
     const sent = await recordRunSentClaimed(loopID, claimed);
-    if (!sent)
+    if (!sent) {
+      const current = await getLoop(loopID);
+      if (current)
+        scheduleTimer(current);
       return;
+    }
     if (sent.mode !== "dynamic" || sent.status !== "active")
       dynamicPending.delete(loopID);
     scheduleTimer(sent);
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now = Date.now();
+    const now2 = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now)
+      if (loop.nextRunAt == null || loop.nextRunAt > now2)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -1468,6 +1540,9 @@ async function setupV2(context) {
     }
   }
   async function settleDynamicLoops(sessionID) {
+    const lease = ownedSessions.get(sessionID);
+    if (!lease)
+      return;
     for (const [loopID, pending] of dynamicPending) {
       if (pending.sessionID !== sessionID || !pending.sawBusy)
         continue;
@@ -1477,7 +1552,7 @@ async function setupV2(context) {
         continue;
       if (loop.nextRunAt != null)
         continue;
-      await stopLoop(loopID, "the iteration ended without scheduling the next run").catch(() => {
+      await stopLoopIfUnchanged(loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease).catch(() => {
         return;
       });
       v2Log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID });
@@ -1502,11 +1577,14 @@ async function setupV2(context) {
     observedSessions.add(sessionID);
     if (!await acquireOwnership(sessionID))
       return;
+    const lease = ownedSessions.get(sessionID);
+    if (!lease)
+      return;
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID)
         continue;
       staleDynamicCandidates.delete(loopID);
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted");
+      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
@@ -1619,8 +1697,10 @@ async function setupV2(context) {
   }));
   await rehydrate().catch(() => v2Log("error", "Failed to rehydrate loops", { category: "state" }));
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of ownedSessions.keys())
-      renewOwnership(sessionID);
+    for (const sessionID of observedSessions) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID);
+      operation.catch(() => v2Log("error", "Loop lease heartbeat failed", { category: "state" }));
+    }
   }, SESSION_LEASE_HEARTBEAT_MS);
   leaseHeartbeat.unref?.();
   const abortController = new AbortController;
@@ -1642,6 +1722,8 @@ async function setupV2(context) {
     }
   })();
   return async () => {
+    disposed = true;
+    await Promise.all(ownershipQueues.values());
     clearInterval(leaseHeartbeat);
     abortController.abort();
     for (const timer of timers.values())

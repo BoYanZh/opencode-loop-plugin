@@ -150,6 +150,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const dynamicMaxDelaySeconds = positiveNumberOr(options?.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS)
   const restrictedAgents = restrictedAgentSet(options)
 
+  let disposed = false
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const sendingLoops = new Set<string>()
   const busySessions = new Set<string>()
@@ -195,6 +196,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
   async function acquireOwnership(sessionID: string) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed) return false
       observedSessions.add(sessionID)
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS)
       if (!lease) {
@@ -209,6 +211,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
   async function renewOwnership(sessionID: string) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed) return false
       const lease = ownedSessions.get(sessionID)
       if (!lease) return false
       const renewed = await renewSessionLease(sessionID, instanceID, lease.revision, SESSION_LEASE_MS)
@@ -223,7 +226,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
   function scheduleTimer(loop: LoopSnapshot, minimumDelayMs = 0) {
     cancelTimer(loop.id)
-    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID)) return
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID)) return
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now())
     const timer = setTimeout(() => {
       timers.delete(loop.id)
@@ -268,7 +271,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       await log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" })
       return
     }
-    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS)
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
     const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null
     if (!claimed) {
       loop = await getLoop(loopID)
@@ -302,7 +305,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false })
     }
-    if (!(await confirmRunClaim(loopID, claimed))) {
+    if (disposed || !(await confirmRunClaim(loopID, claimed))) {
       dynamicPending.delete(loopID)
       const current = await getLoop(loopID)
       if (current) scheduleTimer(current)
@@ -318,6 +321,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       })
     } catch (error) {
       dynamicPending.delete(loopID)
+      await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
       const failed = await recordRunFailedClaimed(
         loopID,
         claimed,
@@ -336,8 +340,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
     }
     busySessions.add(loop.sessionID)
     observedSessions.add(loop.sessionID)
+    await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
     const sent = await recordRunSentClaimed(loopID, claimed)
-    if (!sent) return
+    if (!sent) {
+      const current = await getLoop(loopID)
+      if (current) scheduleTimer(current)
+      return
+    }
     if (sent.mode !== "dynamic" || sent.status !== "active") dynamicPending.delete(loopID)
     scheduleTimer(sent)
   }
@@ -354,13 +363,17 @@ const server: Plugin = async ({ client }, options?: Options) => {
   }
 
   async function settleDynamicLoops(sessionID: string) {
+    const lease = ownedSessions.get(sessionID)
+    if (!lease) return
     for (const [loopID, pending] of dynamicPending) {
       if (pending.sessionID !== sessionID || !pending.sawBusy) continue
       dynamicPending.delete(loopID)
       const loop = await getLoop(loopID)
       if (!loop || loop.status !== "active" || loop.mode !== "dynamic") continue
       if (loop.nextRunAt != null) continue
-      await stopLoop(loopID, "the iteration ended without scheduling the next run").catch(() => undefined)
+      await stopLoopIfUnchanged(
+        loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease,
+      ).catch(() => undefined)
       await log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID })
     }
   }
@@ -387,10 +400,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
   async function observeSession(sessionID: string) {
     observedSessions.add(sessionID)
     if (!(await acquireOwnership(sessionID))) return
+    const lease = ownedSessions.get(sessionID)
+    if (!lease) return
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
       staleDynamicCandidates.delete(loopID)
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted")
+      await stopLoopIfUnchanged(
+        loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
+      )
     }
   }
 
@@ -404,12 +421,17 @@ const server: Plugin = async ({ client }, options?: Options) => {
 
   await rehydrate().catch(() => log("error", "Failed to rehydrate loops", { category: "state" }))
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of ownedSessions.keys()) void renewOwnership(sessionID)
+    for (const sessionID of observedSessions) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID)
+      void operation.catch(() => log("error", "Loop lease heartbeat failed", { category: "state" }))
+    }
   }, SESSION_LEASE_HEARTBEAT_MS)
   leaseHeartbeat.unref?.()
 
   return {
     async dispose() {
+      disposed = true
+      await Promise.all(ownershipQueues.values())
       clearInterval(leaseHeartbeat)
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
@@ -674,6 +696,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS)
   const restrictedAgents = restrictedAgentSet(options)
 
+  let disposed = false
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const sendingLoops = new Set<string>()
   const busySessions = new Set<string>()
@@ -729,6 +752,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   async function acquireOwnership(sessionID: string) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed) return false
       observedSessions.add(sessionID)
       const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS)
       if (!lease) {
@@ -743,6 +767,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   async function renewOwnership(sessionID: string) {
     return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      if (disposed) return false
       const lease = ownedSessions.get(sessionID)
       if (!lease) return false
       const renewed = await renewSessionLease(sessionID, instanceID, lease.revision, SESSION_LEASE_MS)
@@ -757,7 +782,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   function scheduleTimer(loop: LoopSnapshot, minimumDelayMs = 0) {
     cancelTimer(loop.id)
-    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID)) return
+    if (disposed || loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID)) return
     const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now())
     const timer = setTimeout(() => {
       timers.delete(loop.id)
@@ -801,7 +826,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       v2Log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" })
       return
     }
-    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS)
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
     const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null
     if (!claimed) {
       loop = await getLoop(loopID)
@@ -835,7 +860,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false })
     }
-    if (!(await confirmRunClaim(loopID, claimed))) {
+    if (disposed || !(await confirmRunClaim(loopID, claimed))) {
       dynamicPending.delete(loopID)
       const current = await getLoop(loopID)
       if (current) scheduleTimer(current)
@@ -849,6 +874,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       })
     } catch (error) {
       dynamicPending.delete(loopID)
+      await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
       const failed = await recordRunFailedClaimed(
         loopID,
         claimed,
@@ -867,8 +893,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }
     busySessions.add(loop.sessionID)
     observedSessions.add(loop.sessionID)
+    await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS, lease)
     const sent = await recordRunSentClaimed(loopID, claimed)
-    if (!sent) return
+    if (!sent) {
+      const current = await getLoop(loopID)
+      if (current) scheduleTimer(current)
+      return
+    }
     if (sent.mode !== "dynamic" || sent.status !== "active") dynamicPending.delete(loopID)
     scheduleTimer(sent)
   }
@@ -885,13 +916,17 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   async function settleDynamicLoops(sessionID: string) {
+    const lease = ownedSessions.get(sessionID)
+    if (!lease) return
     for (const [loopID, pending] of dynamicPending) {
       if (pending.sessionID !== sessionID || !pending.sawBusy) continue
       dynamicPending.delete(loopID)
       const loop = await getLoop(loopID)
       if (!loop || loop.status !== "active" || loop.mode !== "dynamic") continue
       if (loop.nextRunAt != null) continue
-      await stopLoop(loopID, "the iteration ended without scheduling the next run").catch(() => undefined)
+      await stopLoopIfUnchanged(
+        loopID, loop.updatedAt, "the iteration ended without scheduling the next run", lease,
+      ).catch(() => undefined)
       v2Log("info", "Dynamic loop ended because the turn did not schedule the next run", { loopID })
     }
   }
@@ -915,10 +950,14 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   async function observeSession(sessionID: string) {
     observedSessions.add(sessionID)
     if (!(await acquireOwnership(sessionID))) return
+    const lease = ownedSessions.get(sessionID)
+    if (!lease) return
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
       staleDynamicCandidates.delete(loopID)
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted")
+      await stopLoopIfUnchanged(
+        loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
+      )
     }
   }
 
@@ -1038,7 +1077,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
 
   await rehydrate().catch(() => v2Log("error", "Failed to rehydrate loops", { category: "state" }))
   const leaseHeartbeat = setInterval(() => {
-    for (const sessionID of ownedSessions.keys()) void renewOwnership(sessionID)
+    for (const sessionID of observedSessions) {
+      const operation = ownedSessions.has(sessionID) ? renewOwnership(sessionID) : observeSession(sessionID)
+      void operation.catch(() => v2Log("error", "Loop lease heartbeat failed", { category: "state" }))
+    }
   }, SESSION_LEASE_HEARTBEAT_MS)
   leaseHeartbeat.unref?.()
 
@@ -1060,6 +1102,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   })()
 
   return async () => {
+    disposed = true
+    await Promise.all(ownershipQueues.values())
     clearInterval(leaseHeartbeat)
     abortController.abort()
     for (const timer of timers.values()) clearTimeout(timer)

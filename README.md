@@ -185,7 +185,7 @@ Defaults:
 - `max_loops_per_session`: `5` open (active or paused) loops per session.
 - `busy_backoff_seconds`: `60`; retry delay when an iteration comes due while the session is busy.
 - `failure_backoff_seconds`: `60`; base retry delay when injecting the iteration prompt fails. Consecutive failures double this delay.
-- `max_failure_backoff_seconds`: `3600`; upper bound for exponential failure backoff.
+- `max_failure_backoff_seconds`: `3600`; upper bound for exponential failure backoff, including the first retry.
 - `max_consecutive_failures`: `5`; number of consecutive provider/model failures after which the loop is paused with an inspectable `blockedReason`.
 - `max_loop_age_days`: `7`; loops stop automatically after this age. Set `0` to disable expiry.
 - `dynamic_max_delay_seconds`: `86400`; upper clamp for `schedule_next_run` delays.
@@ -210,6 +210,11 @@ If `XDG_DATA_HOME` is not set, the default is:
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
 
 The state file is written atomically with owner-only permissions when the host filesystem supports it. Persisted loops are rehydrated only after authoritative session context establishes a renewable session lease, preventing concurrent OpenCode instances from driving the same session. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
+
+
+Session lease revisions identify ownership epochs; heartbeats keep the current epoch stable. Claims and automatic dynamic-loop cleanup are checked against that session epoch. Pausing, stopping, or explicitly rescheduling a loop invalidates any pending delivery claim.
+
+State mutations use an atomic lock with a process ID and unique owner token. A suspended live writer keeps its lock; a crashed writer's lock is recovered only after its process has exited. Waiting for a live writer times out after 30 seconds rather than stealing its lock. This coordinates processes on the same host; sharing one state path between different hosts is unsupported.
 
 ## Credits
 

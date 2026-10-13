@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
@@ -19,6 +20,9 @@ import {
   ownsSessionLease,
   recordRunDeferred,
   recordRunSentClaimed,
+  recordRunFailedClaimed,
+  recordRunDeferredClaimed,
+  stopLoopClaimed,
   recordRunFailed,
   recordRunSent,
   releaseSessionLease,
@@ -73,9 +77,8 @@ test("atomically acquires, revises, validates, and releases session leases", asy
   expect(await ownsSessionLease("ses_1", "instance-a", first!.revision)).toBe(true)
 
   const renewed = await renewSessionLease("ses_1", "instance-a", first!.revision, 60_000)
-  expect(renewed?.revision).toBe(2)
-  expect(await ownsSessionLease("ses_1", "instance-a", first!.revision)).toBe(false)
-  expect(await releaseSessionLease("ses_1", "instance-a", first!.revision)).toBe(false)
+  expect(renewed?.revision).toBe(1)
+  expect(await ownsSessionLease("ses_1", "instance-a", first!.revision)).toBe(true)
   expect(await releaseSessionLease("ses_1", "instance-a", renewed!.revision)).toBe(true)
   expect((await acquireSessionLease("ses_1", "instance-b", 60_000))?.instanceID).toBe("instance-b")
 })
@@ -350,4 +353,112 @@ test("formats loop lists for reports", async () => {
   expect(report).toContain(created.id)
   expect(report).toContain("every 10m")
   expect(report).toContain("check the deploy")
+})
+
+
+test("session lease renewals preserve claims but ownership transfer fences every transition", async () => {
+  const loop = await createLoop("ses_1", { prompt: "tick", intervalMs: 1 })
+  const lease = (await acquireSessionLease("ses_1", "a", 60_000))!
+  const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000, lease))!
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
+  expect(claim).not.toBeNull()
+  await renewSessionLease("ses_1", "a", lease.revision, 60_000)
+  await acquireSessionLease("ses_1", "a", 60_000)
+  expect(await confirmRunClaim(loop.id, claim)).not.toBeNull()
+  await releaseSessionLease("ses_1", "a", lease.revision)
+  await acquireSessionLease("ses_1", "b", 60_000)
+  expect(await confirmRunClaim(loop.id, claim)).toBeNull()
+  expect(await recordRunSentClaimed(loop.id, claim)).toBeNull()
+  expect(await recordRunFailedClaimed(loop.id, claim, "failure", 1)).toBeNull()
+  expect(await recordRunDeferredClaimed(loop.id, claim, "skipped_busy", 1)).toBeNull()
+  expect(await stopLoopClaimed(loop.id, claim)).toBeNull()
+  expect((await getLoop(loop.id))?.runCount).toBe(0)
+})
+
+test("pause, stop, and explicit rescheduling revoke an in-flight claim", async () => {
+  for (const control of [pauseLoop, stopLoop, (id: string) => scheduleNextRun(id, 60_000)]) {
+    const loop = await createLoop("ses_1", { prompt: "tick", intervalMs: 1 })
+    const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000))!
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
+    expect(claim).not.toBeNull()
+    await control(loop.id)
+    expect(await confirmRunClaim(loop.id, claim)).toBeNull()
+    if ((await getLoop(loop.id))?.status === "paused") {
+      await resumeLoop(loop.id)
+      expect(await confirmRunClaim(loop.id, claim)).toBeNull()
+    }
+  }
+})
+
+test("orphan dynamic cleanup is fenced by session ownership", async () => {
+  const loop = await createLoop("ses_1", { prompt: "tick", mode: "dynamic" })
+  const lease = (await acquireSessionLease("ses_1", "a", 60_000))!
+  await releaseSessionLease("ses_1", "a", lease.revision)
+  await acquireSessionLease("ses_1", "b", 60_000)
+  expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "stale", lease)).toBeNull()
+  expect((await getLoop(loop.id))?.status).toBe("active")
+})
+
+test("maximum failure backoff caps even the first retry", async () => {
+  const loop = await createLoop("ses_1", { prompt: "tick", intervalMs: 1 })
+  const failed = await recordRunFailed(loop.id, "failure", 60_000, 5, 1000)
+  expect(failed.nextRetryAt! - failed.updatedAt).toBe(1000)
+  await scheduleNextRun(loop.id, 1)
+  const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000))!
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
+  const claimedFailure = await recordRunFailedClaimed(loop.id, claim, "failure", 60_000, 5, 1000)
+  expect(claimedFailure!.nextRetryAt! - claimedFailure!.updatedAt).toBe(1000)
+})
+
+test("recovers a crashed writer lock without stealing a suspended live writer lock", async () => {
+  const worker = join(dir, "lock.ts")
+  const lock = `${process.env.OPENCODE_LOOP_STATE_PATH}.lock`
+  await writeFile(worker, `import { writeFile } from "node:fs/promises"\n` +
+    `import { randomUUID } from "node:crypto"\n` +
+    `await writeFile(process.argv[2], process.pid + "-" + randomUUID())\n`)
+  const child = Bun.spawn([process.execPath, worker, lock], { stdout: "pipe" })
+  expect(await child.exited).toBe(0)
+  const created = await createLoop("ses_1", { prompt: "tick", mode: "dynamic" })
+  expect(created.status).toBe("active")
+  const { utimes } = await import("node:fs/promises")
+  await writeFile(lock, `${process.pid}-${randomUUID()}`)
+  // A 30-second age must not authorize taking a live process's lock.
+  const old = new Date(Date.now() - 60_000)
+  await utimes(lock, old, old)
+  let finished = false
+  const pending = createLoop("ses_2", { prompt: "tick", mode: "dynamic" }).then((loop) => { finished = true; return loop })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(finished).toBe(false)
+  await rm(lock)
+  expect((await pending).status).toBe("active")
+})
+
+
+test("recovers a crashed lock reclaimer", async () => {
+  const worker = join(dir, "reclaim.ts")
+  const lock = `${process.env.OPENCODE_LOOP_STATE_PATH}.lock`
+  await writeFile(worker, `import { writeFile } from "node:fs/promises"\n` +
+    `import { randomUUID } from "node:crypto"\n` +
+    `const owner = process.pid + "-" + randomUUID()\n` +
+    `await writeFile(process.argv[2], owner)\n` +
+    `await writeFile(process.argv[2] + ".reclaim." + owner, process.pid + "-" + randomUUID())\n`)
+  const child = Bun.spawn([process.execPath, worker, lock], { stdout: "pipe" })
+  expect(await child.exited).toBe(0)
+  expect((await createLoop("ses_1", { prompt: "tick", mode: "dynamic" })).status).toBe("active")
+})
+
+test("a dynamic iteration counts its run without overwriting the agent's next schedule", async () => {
+  const loop = await createLoop("ses_1", { prompt: "tick", mode: "dynamic", maxRuns: 2 })
+  await scheduleNextRun(loop.id, 1)
+  const owner = (await acquireLoopOwner(loop.id, "owner-a", 60_000))!
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const claim = (await claimDueRunOwned(loop.id, owner, 60_000))!
+  expect(await confirmRunClaim(loop.id, claim)).not.toBeNull()
+  const scheduled = await scheduleNextRun(loop.id, 60_000)
+  const sent = await recordRunSentClaimed(loop.id, claim)
+  expect(sent?.runCount).toBe(1)
+  expect(sent?.nextRunAt).toBe(scheduled.nextRunAt)
 })

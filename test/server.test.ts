@@ -315,3 +315,33 @@ test("V1 rehydrate leaves a foreign unscheduled dynamic loop unchanged", async (
   await foreign.dispose?.()
   await first.dispose?.()
 })
+
+
+test("slow accepted delivery retains run accounting after the initial owner lease expires", async () => {
+  const sent: SentPrompt[] = []
+  const originalNow = Date.now
+  const client = fakeClient(sent)
+  const originalPrompt = client.session.promptAsync
+  client.session.promptAsync = async (input) => {
+    await originalPrompt(input)
+    const acceptedAt = originalNow()
+    Date.now = () => acceptedAt + 31_000
+  }
+  const hooks = await serverModule.server(
+    { client } as never,
+    { min_interval_seconds: 1 } as never,
+  )
+  try {
+    const created = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "tick", interval: "1s", max_runs: 1 }, { sessionID: "ses_slow" },
+    )) as { created: string }
+    await sleep(1300)
+    expect(sent).toHaveLength(1)
+    const loop = await getLoop(created.created)
+    expect(loop?.runCount).toBe(1)
+    expect(loop?.status).toBe("completed")
+  } finally {
+    Date.now = originalNow
+    await hooks.dispose?.()
+  }
+})

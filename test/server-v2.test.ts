@@ -548,3 +548,31 @@ test("V2 cleanup disposes registrations, clears timers, and stops the event cons
   expect(mock.promptCalls).toHaveLength(0)
   expect((await getLoop(created.created))?.status).toBe("active")
 })
+
+
+test("V2 slow accepted delivery retains run accounting after its owner lease expires", async () => {
+  const mock = makeMockContext()
+  const originalNow = Date.now
+  const originalPrompt = mock.session.prompt
+  mock.session.prompt = async (input) => {
+    const result = await originalPrompt(input)
+    const acceptedAt = originalNow()
+    Date.now = () => acceptedAt + 31_000
+    return result
+  }
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    const created = JSON.parse(contentOf(await loopTool(mock, "create_loop").execute(
+      { instruction: "tick", interval: "1s", max_runs: 1 }, toolContext("ses_slow"),
+    ))) as { created: string }
+    await sleep(1300)
+    expect(mock.promptCalls).toHaveLength(1)
+    const loop = await getLoop(created.created)
+    expect(loop?.runCount).toBe(1)
+    expect(loop?.status).toBe("completed")
+  } finally {
+    Date.now = originalNow
+    mock.stream.end()
+    await cleanup()
+  }
+})
