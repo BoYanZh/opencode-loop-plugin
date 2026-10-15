@@ -29,15 +29,13 @@
   "author": "Prevalentware",
   "type": "module",
   "exports": {
-    "./server": {
-      "import": "./dist/server.js"
-    },
-    "./tui": {
-      "import": "./src/tui.tsx"
-    }
+    "./server": "./server.js",
+    "./tui": "./tui.js"
   },
   "files": [
     "dist",
+    "server.js",
+    "tui.js",
     "src/tui.tsx",
     "LICENSE",
     "README.md"

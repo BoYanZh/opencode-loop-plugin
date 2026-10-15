@@ -99,6 +99,11 @@ bun scripts/install.mjs --global
 bun scripts/install.mjs --project /path/to/project
 ```
 
+File-spec installs (local paths) require the entry files at the package root:
+`./server.js` and `./tui.js` re-export `./dist/server.js` and `./src/tui.tsx`.
+Subpath-only entries are silently skipped by some hosts, so keep the root
+bridges even though the built bundle lives in `dist/`.
+
 V2 supports the `/loop` command, all loop tools, persistent state, idle scheduling, dynamic loops, Plan-mode safety, session cleanup, TUI sidebar/palette integration, and the `compaction` hook for preserving loops across compaction. Stale dynamic loops resume with a configurable fallback delay after restart (`dynamic_restart_mode: "fallback"`, default 20m) instead of stopping.
 
 ## Usage
