@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -6,10 +6,7 @@ import { dirname, join, resolve } from "node:path"
 const PACKAGE_NAME = "@prevalentware/opencode-loop-plugin"
 
 function configDir() {
-  if (process.env.XDG_CONFIG_HOME) return resolve(process.env.XDG_CONFIG_HOME, "opencode")
-  if (process.platform === "win32" && process.env.APPDATA) return join(process.env.APPDATA, "..", "Local", "opencode")
-  const base = process.platform === "win32" ? join(homedir(), "AppData", "Local") : join(homedir(), ".config")
-  return join(base, "opencode")
+  return resolve(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")
 }
 
 function readJson(path) {
@@ -19,7 +16,7 @@ function readJson(path) {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected an object")
     return value
   } catch {
-    throw new Error(`invalid JSON: ${path}`)
+    throw new Error(`expected a JSON object: ${path}; comments and trailing commas are not supported, edit manually`)
   }
 }
 
@@ -41,11 +38,13 @@ function addPlugin(list, pkg) {
 }
 
 function writeJson(path, value) {
-  mkdirSync(dirname(path), { recursive: true })
-  const temporary = `${path}.${randomUUID()}.tmp`
+  const target = existsSync(path) ? realpathSync(path) : path
+  const mode = existsSync(target) ? statSync(target).mode & 0o777 : 0o600
+  mkdirSync(dirname(target), { recursive: true })
+  const temporary = `${target}.${randomUUID()}.tmp`
   try {
-    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    renameSync(temporary, path)
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode })
+    renameSync(temporary, target)
   } finally {
     rmSync(temporary, { force: true })
   }
@@ -72,18 +71,24 @@ function main() {
   }
   if (global && projectDir) throw new Error("choose --global or --project")
 
-  const targets = []
-  if (projectDir) {
-    targets.push({ kind: "server(project)", path: join(projectDir, "opencode.json") })
-  } else {
-    targets.push({ kind: "server(global)", path: join(configDir(), "opencode.json") })
+  const serverPaths = projectDir
+    ? [join(projectDir, "opencode.json"), join(projectDir, ".opencode", "opencode.json")]
+    : [join(configDir(), "opencode.json")]
+  for (const path of [...serverPaths, join(configDir(), "cli.json")]) {
+    const jsonc = path.replace(/\.json$/, ".jsonc")
+    if (existsSync(jsonc)) throw new Error(`edit the existing JSONC configuration manually: ${jsonc}`)
   }
+  const serverConfigs = serverPaths.map((path) => {
+    const current = readJson(path)
+    return { path, plugins: ensurePluginList(current.plugins) }
+  })
+  const serverPath = serverConfigs.find(({ plugins }) => plugins.some((entry) => pluginKey(entry) === pluginKey(pkg)))?.path
+    ?? serverPaths.find(existsSync) ?? serverPaths[0]
+  const targets = []
+  targets.push({ kind: projectDir ? "server(project)" : "server(global)", path: serverPath })
   targets.push({ kind: "tui", path: join(configDir(), "cli.json") })
 
   const updates = targets.map((target) => {
-    if (existsSync(target.path.replace(/\.json$/, ".jsonc"))) {
-      throw new Error(`edit the existing JSONC configuration manually: ${target.path.replace(/\.json$/, ".jsonc")}`)
-    }
     const current = readJson(target.path)
     const { list, added } = addPlugin(ensurePluginList(current.plugins), pkg)
     return { ...target, current, list, added }

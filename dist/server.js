@@ -25358,7 +25358,7 @@ async function setupV2(context4) {
     const contextText = compactionContext(loops);
     if (!contextText)
       return;
-    if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER)))
+    if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes("OpenCode loop mode is tracking recurring loops for this session across compaction.")))
       return;
     sessionCompaction.system.push({ type: "text", text: contextText });
   }));

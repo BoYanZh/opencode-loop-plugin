@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -75,4 +75,36 @@ test("installer refuses JSONC before creating a competing JSON configuration", a
   expect((await install("--global")).code).not.toBe(0)
   expect(await readFile(join(config, "cli.jsonc"), "utf8")).toBe(original)
   expect(await Bun.file(join(config, "opencode.json")).exists()).toBe(false)
+})
+
+test("project installer respects nested pinned config even when a root config exists", async () => {
+  const project = join(directory, "project")
+  await mkdir(join(project, ".opencode"), { recursive: true })
+  const nested = JSON.stringify({ plugins: [`${packageName}@0.1.13`] })
+  await writeFile(join(project, ".opencode", "opencode.json"), nested)
+  await writeFile(join(project, "opencode.json"), "{}")
+  expect((await install("--project", project)).code).toBe(0)
+  expect(await readFile(join(project, "opencode.json"), "utf8")).toBe("{}")
+  expect(await readFile(join(project, ".opencode", "opencode.json"), "utf8")).toBe(nested)
+})
+
+test("project installer refuses nested JSONC before writing either config", async () => {
+  const project = join(directory, "project")
+  await mkdir(join(project, ".opencode"), { recursive: true })
+  await writeFile(join(project, ".opencode", "opencode.jsonc"), "{}")
+  expect((await install("--project", project)).code).not.toBe(0)
+  expect(await Bun.file(join(project, "opencode.json")).exists()).toBe(false)
+  expect(await Bun.file(join(config, "cli.json")).exists()).toBe(false)
+})
+
+test("installer preserves config symlinks and existing permissions", async () => {
+  const target = join(directory, "dotfiles.json")
+  await writeFile(target, "{}", { mode: 0o640 })
+  const mode = (await stat(target)).mode & 0o777
+  const link = join(config, "opencode.json")
+  await symlink(target, link)
+  expect((await install("--global")).code).toBe(0)
+  expect((await lstat(link)).isSymbolicLink()).toBe(true)
+  expect((await stat(target)).mode & 0o777).toBe(mode)
+  expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ plugins: [packageName] })
 })

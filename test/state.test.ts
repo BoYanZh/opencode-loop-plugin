@@ -182,7 +182,10 @@ test("stale dynamic loops resume with fallback delay instead of stopping", async
 
   const changed = (await getLoop(created.id))!
   expect(await rescheduleDynamicIfUnchanged(created.id, created.updatedAt, 120_000, "stale")).toBeNull()
-  expect(changed.nextRunAt).not.toBeNull()
+  const after = await getLoop(created.id)
+  expect(after?.nextRunAt).toBe(changed.nextRunAt)
+  expect(after?.updatedAt).toBe(changed.updatedAt)
+  expect(after?.scheduleRevision).toBe(changed.scheduleRevision)
 })
 
 test("serializes state mutations across processes", async () => {

@@ -349,7 +349,7 @@ test("V2 compaction preserves open loops per session without duplicating context
     await loopTool(mock, "create_loop").execute({ instruction: "preserve this task", interval: "1m" }, toolContext())
     const compaction = mock.hooks.compaction
     if (!compaction) throw new Error("compaction hook not registered")
-    const input = { sessionID: "ses_v2", system: [{ type: "text", text: "base" }] }
+    const input = { sessionID: "ses_v2", system: [{ type: "text", text: "OpenCode loop mode reminder: existing per-turn context" }] }
     await compaction(input)
     await compaction(input)
     expect(input.system).toHaveLength(2)

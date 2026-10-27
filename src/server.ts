@@ -1231,7 +1231,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const loops = await openLoops(sessionCompaction.sessionID)
       const contextText = compactionContext(loops)
       if (!contextText) return
-      if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER))) return
+      if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes("OpenCode loop mode is tracking recurring loops for this session across compaction."))) return
       sessionCompaction.system.push({ type: "text", text: contextText })
     }),
   )
