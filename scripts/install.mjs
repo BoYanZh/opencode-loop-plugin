@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
@@ -14,7 +15,9 @@ function configDir() {
 function readJson(path) {
   if (!existsSync(path)) return {}
   try {
-    return JSON.parse(readFileSync(path, "utf8"))
+    const value = JSON.parse(readFileSync(path, "utf8"))
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected an object")
+    return value
   } catch {
     throw new Error(`invalid JSON: ${path}`)
   }
@@ -27,26 +30,47 @@ function ensurePluginList(value) {
 }
 
 function pluginKey(entry) {
-  if (typeof entry === "string") return entry
-  if (entry && typeof entry === "object" && typeof entry.package === "string") return entry.package
-  return null
+  const spec = typeof entry === "string" ? entry : entry?.package
+  if (typeof spec !== "string") return null
+  return spec.replace(/^(?:(@[^/]+\/[^@/]+)|([^@./][^@/]*))@.+$/, "$1$2")
 }
 
 function addPlugin(list, pkg) {
-  if (list.some((entry) => pluginKey(entry) === pkg)) return { list, added: false }
+  if (list.some((entry) => pluginKey(entry) === pluginKey(pkg))) return { list, added: false }
   return { list: [...list, pkg], added: true }
 }
 
 function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
+  const temporary = `${path}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally {
+    rmSync(temporary, { force: true })
+  }
 }
 
 function main() {
   const args = process.argv.slice(2)
-  const projectDir = args.includes("--project") ? resolve(args[args.indexOf("--project") + 1] ?? ".") : null
-  const pkg = args.includes("--package") ? args[args.indexOf("--package") + 1] : PACKAGE_NAME
-  if (!pkg) throw new Error("missing package name")
+  let projectDir = null
+  let global = false
+  let pkg = PACKAGE_NAME
+  const seen = new Set()
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index]
+    if (!["--global", "--project", "--package"].includes(flag) || seen.has(flag)) throw new Error(`invalid argument: ${flag}`)
+    seen.add(flag)
+    if (flag === "--global") {
+      global = true
+      continue
+    }
+    const value = args[++index]
+    if (!value || value.startsWith("--")) throw new Error(`missing value for ${flag}`)
+    if (flag === "--project") projectDir = resolve(value)
+    else pkg = value
+  }
+  if (global && projectDir) throw new Error("choose --global or --project")
 
   const targets = []
   if (projectDir) {
@@ -56,14 +80,21 @@ function main() {
   }
   targets.push({ kind: "tui", path: join(configDir(), "cli.json") })
 
-  for (const target of targets) {
+  const updates = targets.map((target) => {
+    if (existsSync(target.path.replace(/\.json$/, ".jsonc"))) {
+      throw new Error(`edit the existing JSONC configuration manually: ${target.path.replace(/\.json$/, ".jsonc")}`)
+    }
     const current = readJson(target.path)
     const { list, added } = addPlugin(ensurePluginList(current.plugins), pkg)
+    return { ...target, current, list, added }
+  })
+
+  for (const { kind, path, current, list, added } of updates) {
     if (added) {
-      writeJson(target.path, { ...current, plugins: list })
-      console.log(`added ${pkg} to ${target.kind}: ${target.path}`)
+      writeJson(path, { ...current, plugins: list })
+      console.log(`added ${pkg} to ${kind}: ${path}`)
     } else {
-      console.log(`already present in ${target.kind}: ${target.path}`)
+      console.log(`already present in ${kind}: ${path}`)
     }
   }
 }

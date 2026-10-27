@@ -412,7 +412,12 @@ test("orphan dynamic cleanup is fenced by session ownership", async () => {
   await releaseSessionLease("ses_1", "a", lease.revision)
   await acquireSessionLease("ses_1", "b", 60_000)
   expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "stale", lease)).toBeNull()
+  expect(await rescheduleDynamicIfUnchanged(loop.id, loop.updatedAt, 60_000, "restart", lease)).toBeNull()
+  const foreign = (await acquireSessionLease("ses_other", "a", 60_000))!
+  expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "stale", foreign)).toBeNull()
+  expect(await rescheduleDynamicIfUnchanged(loop.id, loop.updatedAt, 60_000, "restart", foreign)).toBeNull()
   expect((await getLoop(loop.id))?.status).toBe("active")
+  expect((await getLoop(loop.id))?.nextRunAt).toBeNull()
 })
 
 test("maximum failure backoff caps even the first retry", async () => {

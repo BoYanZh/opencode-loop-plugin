@@ -36,6 +36,7 @@
     "dist",
     "server.js",
     "tui.js",
+    "scripts/install.mjs",
     "src/tui.tsx",
     "LICENSE",
     "README.md"

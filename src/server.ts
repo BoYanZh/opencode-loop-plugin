@@ -94,7 +94,7 @@ function restrictedAgentSet(options?: Options) {
 }
 
 function dynamicRestartMode(options?: Options) {
-  return options?.dynamic_restart_mode?.trim().toLowerCase() === "stop" ? "stop" : "fallback"
+  return typeof options?.dynamic_restart_mode === "string" && options.dynamic_restart_mode.trim().toLowerCase() === "stop" ? "stop" : "fallback"
 }
 
 function dynamicRestartFallbackMs(options?: Options, minIntervalSeconds?: number, dynamicMaxDelaySeconds?: number) {
@@ -454,20 +454,20 @@ const server: Plugin = async ({ client, directory }, options?: Options) => {
     if (!lease) return
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
-      staleDynamicCandidates.delete(loopID)
       if (restartMode === "fallback") {
         const rescheduled = await rescheduleDynamicIfUnchanged(
           loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease,
-        ).catch(() => null)
+        )
         if (rescheduled) {
           scheduleTimer(rescheduled)
           await log("info", "Dynamic loop resumed with fallback delay after restart", { loopID })
-          continue
         }
+      } else {
+        await stopLoopIfUnchanged(
+          loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
+        )
       }
-      await stopLoopIfUnchanged(
-        loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
-      )
+      staleDynamicCandidates.delete(loopID)
     }
   }
 
@@ -1072,23 +1072,23 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (!lease) return
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID) continue
-      staleDynamicCandidates.delete(loopID)
       if (restartMode === "fallback") {
         const rescheduled = await rescheduleDynamicIfUnchanged(
           loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease,
-        ).catch(() => null)
+        )
         if (rescheduled) {
           scheduleTimer(rescheduled)
           v2Log("info", "Dynamic loop resumed with fallback delay after restart", {
             loopID,
             sessionID,
           })
-          continue
         }
+      } else {
+        await stopLoopIfUnchanged(
+          loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
+        )
       }
-      await stopLoopIfUnchanged(
-        loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease,
-      )
+      staleDynamicCandidates.delete(loopID)
     }
   }
 

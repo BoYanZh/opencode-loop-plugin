@@ -649,7 +649,7 @@ export async function stopLoopIfUnchanged(
 ) {
   return mutate((state) => {
     const loop = state.loops[loopID]
-    if (!loop || (sessionLease && !matchesSessionLease(state, sessionLease))) return null
+    if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
     if (
       loop.updatedAt !== expectedUpdatedAt ||
       loop.status !== "active" ||
@@ -676,7 +676,7 @@ export async function rescheduleDynamicIfUnchanged(
   if (delay == null) throw new Error("delay must be a positive number of milliseconds")
   return mutate((state) => {
     const loop = state.loops[loopID]
-    if (!loop || (sessionLease && !matchesSessionLease(state, sessionLease))) return null
+    if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
     if (
       loop.updatedAt !== expectedUpdatedAt ||
       loop.status !== "active" ||
