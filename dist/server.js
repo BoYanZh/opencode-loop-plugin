@@ -24017,13 +24017,32 @@ async function stopLoop(loopID, reason) {
 async function stopLoopIfUnchanged(loopID, expectedUpdatedAt, reason, sessionLease) {
   return mutate5((state) => {
     const loop3 = state.loops[loopID];
-    if (!loop3 || sessionLease && !matchesSessionLease(state, sessionLease))
+    if (!loop3 || sessionLease && (sessionLease.sessionID !== loop3.sessionID || !matchesSessionLease(state, sessionLease)))
       return null;
     if (loop3.updatedAt !== expectedUpdatedAt || loop3.status !== "active" || loop3.mode !== "dynamic" || loop3.nextRunAt != null) {
       return null;
     }
     loop3.status = "stopped";
     loop3.stopReason = reason.trim().slice(0, 400) || "stopped";
+    loop3.updatedAt = now2();
+    return snapshot(loop3);
+  });
+}
+async function rescheduleDynamicIfUnchanged(loopID, expectedUpdatedAt, delayMs, reason, sessionLease) {
+  const delay3 = positiveIntegerOrNull(Math.round(delayMs));
+  if (delay3 == null)
+    throw new Error("delay must be a positive number of milliseconds");
+  return mutate5((state) => {
+    const loop3 = state.loops[loopID];
+    if (!loop3 || sessionLease && (sessionLease.sessionID !== loop3.sessionID || !matchesSessionLease(state, sessionLease)))
+      return null;
+    if (loop3.updatedAt !== expectedUpdatedAt || loop3.status !== "active" || loop3.mode !== "dynamic" || loop3.nextRunAt != null) {
+      return null;
+    }
+    loop3.scheduleRevision += 1;
+    loop3.nextRunAt = now2() + delay3;
+    loop3.nextRetryAt = null;
+    loop3.lastReason = reason.trim().slice(0, 400) || loop3.lastReason;
     loop3.updatedAt = now2();
     return snapshot(loop3);
   });
@@ -24256,6 +24275,7 @@ var DEFAULT_MAX_FAILURE_BACKOFF_SECONDS = 60 * 60;
 var DEFAULT_MAX_CONSECUTIVE_FAILURES = 5;
 var DEFAULT_MAX_LOOP_AGE_DAYS = 7;
 var DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60;
+var DEFAULT_DYNAMIC_RESTART_FALLBACK_SECONDS = 20 * 60;
 var RUN_CLAIM_LEASE_MS = 30000;
 var SESSION_LEASE_MS = 90000;
 var SESSION_LEASE_HEARTBEAT_MS = 30000;
@@ -24276,6 +24296,15 @@ function nonNegativeNumberOr(value3, fallback) {
 function restrictedAgentSet(options) {
   const names = Array.isArray(options?.restricted_agents) ? options.restricted_agents : DEFAULT_RESTRICTED_AGENTS;
   return new Set(names.map((name) => typeof name === "string" ? name.trim().toLowerCase() : "").filter(Boolean));
+}
+function dynamicRestartMode(options) {
+  return typeof options?.dynamic_restart_mode === "string" && options.dynamic_restart_mode.trim().toLowerCase() === "stop" ? "stop" : "fallback";
+}
+function dynamicRestartFallbackMs(options, minIntervalSeconds, dynamicMaxDelaySeconds) {
+  const fallbackSeconds = positiveNumberOr(options?.dynamic_restart_fallback_seconds, DEFAULT_DYNAMIC_RESTART_FALLBACK_SECONDS);
+  const minMs = (minIntervalSeconds ?? DEFAULT_MIN_INTERVAL_SECONDS) * 1000;
+  const maxMs = (dynamicMaxDelaySeconds ?? DEFAULT_DYNAMIC_MAX_DELAY_SECONDS) * 1000;
+  return Math.min(Math.max(Math.round(fallbackSeconds * 1000), minMs), Math.max(maxMs, minMs));
 }
 function registerDesktopCommand(config2, commandName, minIntervalSeconds) {
   config2.command ??= {};
@@ -24339,6 +24368,8 @@ var server = async ({ client, directory }, options) => {
   const maxLoopAgeMs = nonNegativeNumberOr(options?.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options?.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
+  const restartMode = dynamicRestartMode(options);
+  const restartFallbackMs = dynamicRestartFallbackMs(options, minIntervalSeconds, dynamicMaxDelaySeconds);
   let disposed = false;
   const timers = new Map;
   const sendingLoops = new Set;
@@ -24604,8 +24635,16 @@ var server = async ({ client, directory }, options) => {
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID)
         continue;
+      if (restartMode === "fallback") {
+        const rescheduled = await rescheduleDynamicIfUnchanged(loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease);
+        if (rescheduled) {
+          scheduleTimer(rescheduled);
+          await log3("info", "Dynamic loop resumed with fallback delay after restart", { loopID });
+        }
+      } else {
+        await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
+      }
       staleDynamicCandidates.delete(loopID);
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
@@ -24869,6 +24908,8 @@ async function setupV2(context4) {
   const maxLoopAgeMs = nonNegativeNumberOr(options.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
+  const restartMode = dynamicRestartMode(options);
+  const restartFallbackMs = dynamicRestartFallbackMs(options, minIntervalSeconds, dynamicMaxDelaySeconds);
   let disposed = false;
   const timers = new Map;
   const sendingLoops = new Set;
@@ -25169,8 +25210,19 @@ async function setupV2(context4) {
     for (const [loopID, candidate] of staleDynamicCandidates) {
       if (candidate.sessionID !== sessionID)
         continue;
+      if (restartMode === "fallback") {
+        const rescheduled = await rescheduleDynamicIfUnchanged(loopID, candidate.updatedAt, restartFallbackMs, "restarted with fallback delay; reschedule or stop after this iteration", lease);
+        if (rescheduled) {
+          scheduleTimer(rescheduled);
+          v2Log("info", "Dynamic loop resumed with fallback delay after restart", {
+            loopID,
+            sessionID
+          });
+        }
+      } else {
+        await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
+      }
       staleDynamicCandidates.delete(loopID);
-      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted", lease);
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
@@ -25299,6 +25351,16 @@ async function setupV2(context4) {
     if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(LOOP_SYSTEM_MARKER)))
       return;
     sessionContext.system.push({ type: "text", text: reminder });
+  }));
+  registrations.push(await context4.session.hook("compaction", async (sessionCompaction) => {
+    await observeSession(sessionCompaction.sessionID);
+    const loops = await openLoops(sessionCompaction.sessionID);
+    const contextText = compactionContext(loops);
+    if (!contextText)
+      return;
+    if (sessionCompaction.system.some((part) => part.type === "text" && part.text.includes("OpenCode loop mode is tracking recurring loops for this session across compaction.")))
+      return;
+    sessionCompaction.system.push({ type: "text", text: contextText });
   }));
   await rehydrate().catch(() => v2Log("error", "Failed to rehydrate loops", { category: "state" }));
   const leaseHeartbeat = setInterval(() => {
