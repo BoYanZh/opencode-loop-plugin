@@ -289,10 +289,10 @@ function processLockRelease(lock: string, ownerPath: string, token: string) {
   const release = async () => {
     try {
       await finish()
-    } catch (error) {
+    } catch {
       // Keep the exact token available for recovery even while this pid lives.
       pendingLockReleases.set(lock, finish)
-      if (isTransientLockError(error) && !timer) {
+      if (!timer) {
         timer = setTimeout(() => { timer = undefined; void release() }, 1000)
         timer.unref?.()
       }
@@ -568,12 +568,16 @@ export async function acquireSessionLease(sessionID: string, instanceID: string,
 }
 
 /** Renews only the exact lease revision previously returned to this instance. */
-export async function renewSessionLease(sessionID: string, instanceID: string, revision: number, leaseMs: number) {
+export async function renewSessionLease(sessionID: string, instanceID: string, revision: number, leaseMs: number, recoverExpired = false) {
   const duration = validLeaseMs(leaseMs)
   return mutate((state) => {
     const timestamp = now()
     const current = state.sessionLeases[sessionID]
-    if (!current || current.instanceID !== instanceID || current.revision !== revision || current.expiresAt <= timestamp) return null
+    if (!current || current.instanceID !== instanceID || current.revision !== revision) return null
+    if (current.expiresAt <= timestamp) {
+      if (!recoverExpired) return null
+      current.revision += 1
+    }
     current.expiresAt = timestamp + duration
     return { ...current }
   })
@@ -734,12 +738,14 @@ export async function stopLoopIfUnchanged(
   expectedUpdatedAt: number,
   reason: string,
   sessionLease?: SessionLease,
+  expectedScheduleRevision?: number,
 ) {
   return mutate((state) => {
     const loop = state.loops[loopID]
     if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
     if (
       loop.updatedAt !== expectedUpdatedAt ||
+      (expectedScheduleRevision !== undefined && loop.scheduleRevision !== expectedScheduleRevision) ||
       loop.status !== "active" ||
       loop.mode !== "dynamic" ||
       loop.nextRunAt != null

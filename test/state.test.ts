@@ -522,3 +522,37 @@ test("classifies transient file-lock errors for the cross-process lock protocol"
   expect(isTransientLockError(null)).toBe(false)
   expect(isTransientLockError("EPERM")).toBe(false)
 })
+
+test("lease recovery preserves exclusive ownership while fencing expired claims", async () => {
+  const originalNow = Date.now
+  let clock = originalNow()
+  Date.now = () => clock
+  try {
+    const lease = (await acquireSessionLease("ses_recover", "owner", 1000))!
+    clock += 1001
+    expect(await renewSessionLease("ses_recover", "owner", lease.revision, 1000)).toBeNull()
+    const recovered = await renewSessionLease("ses_recover", "owner", lease.revision, 1000, true)
+    expect(recovered?.revision).toBe(lease.revision + 1)
+    expect(await ownsSessionLease("ses_recover", "owner", lease.revision)).toBe(false)
+    clock += 1001
+    await acquireSessionLease("ses_recover", "foreign", 1000)
+    expect(await renewSessionLease("ses_recover", "owner", recovered!.revision, 1000, true)).toBeNull()
+  } finally {
+    Date.now = originalNow
+  }
+})
+
+test("a same-timestamp schedule revision fences an older dynamic settlement", async () => {
+  const originalNow = Date.now
+  const clock = originalNow()
+  Date.now = () => clock
+  try {
+    const loop = await createLoop("ses_revision", { prompt: "tick", mode: "dynamic" })
+    await scheduleNextRun(loop.id, 1)
+    await recordRunSent(loop.id)
+    expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "old turn", undefined, loop.scheduleRevision)).toBeNull()
+    expect((await getLoop(loop.id))?.status).toBe("active")
+  } finally {
+    Date.now = originalNow
+  }
+})

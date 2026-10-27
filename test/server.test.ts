@@ -637,3 +637,21 @@ test.each(["session.idle", "session.deleted"])("V1 retries the persisted transit
     await hooks.dispose?.()
   }
 })
+
+test("V1 cached recovery arms an ordinary sibling after its session is observed", async () => {
+  const first = await makeServer([])
+  await tool(first, "create_loop").execute({ instruction: "keep alive", interval: "1m", keep_alive: true }, { sessionID: "ses_rearm" })
+  const ordinary = JSON.parse(await tool(first, "create_loop").execute(
+    { instruction: "ordinary", interval: "1s" }, { sessionID: "ses_rearm" },
+  )) as { created: string }
+  await first.dispose?.()
+  const sent: SentPrompt[] = []
+  const second = await makeServer(sent)
+  try {
+    expect(sent).toHaveLength(0)
+    await second["chat.message"]?.({ sessionID: "ses_rearm", agent: "build" } as never, { message: {} } as never)
+    await waitFor(async () => (await getLoop(ordinary.created))?.runCount === 1)
+  } finally {
+    await second.dispose?.()
+  }
+})
