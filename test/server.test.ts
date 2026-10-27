@@ -596,3 +596,44 @@ test("V1 passive hooks survive loop state failures instead of breaking dialogue"
   expect(sent).toHaveLength(0)
   await hooks.dispose?.()
 })
+
+test("V1 retains Plan safety when passive observation fails", async () => {
+  const sent: SentPrompt[] = []
+  const hooks = await makeServer(sent)
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const created = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "tick", interval: "1s" }, { sessionID: "ses_plan_failure", agent: "build" },
+    )) as { created: string }
+    const blocker = join(dir, "plan-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    await hooks["chat.message"]?.({ sessionID: "ses_plan_failure", agent: "plan" } as never, { message: {} } as never)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await waitFor(async () => (await getLoop(created.created))?.lastResult === "skipped_plan")
+    expect(sent).toHaveLength(0)
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks.dispose?.()
+  }
+})
+
+test.each(["session.idle", "session.deleted"])("V1 retries the persisted transition after %s fails", async (eventType) => {
+  const hooks = await makeServer([])
+  const originalPath = process.env.OPENCODE_LOOP_STATE_PATH
+  try {
+    const result = JSON.parse(await tool(hooks, "create_loop").execute(
+      { instruction: "tick" }, { sessionID: "ses_retry_event" },
+    )) as { created: string }
+    const blocker = join(dir, "event-blocker")
+    await writeFile(blocker, "not a directory")
+    process.env.OPENCODE_LOOP_STATE_PATH = join(blocker, "loops.json")
+    await hooks.event?.({ event: { type: eventType, properties: { sessionID: "ses_retry_event" } } } as never)
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks["chat.message"]?.({ sessionID: "ses_retry_event", agent: "build" } as never, { message: {} } as never)
+    expect((await getLoop(result.created))?.status).toBe("stopped")
+  } finally {
+    process.env.OPENCODE_LOOP_STATE_PATH = originalPath
+    await hooks.dispose?.()
+  }
+})

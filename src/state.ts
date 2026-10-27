@@ -238,7 +238,9 @@ export function isTransientLockError(error: unknown) {
   return (
     typeof error === "object" &&
     error !== null &&
-    TRANSIENT_LOCK_CODES.has((error as NodeJS.ErrnoException).code ?? "")
+    "code" in error &&
+    typeof error.code === "string" &&
+    TRANSIENT_LOCK_CODES.has(error.code)
   )
 }
 
@@ -251,81 +253,92 @@ function processIsAlive(pid: number) {
   }
 }
 
-async function acquireProcessLock(lock: string, deadline: number): Promise<() => Promise<void>> {
-  const token = `${process.pid}-${randomUUID()}`
-  const ownerPath = `${lock}.owner.${token}`
-  const startedAt = Date.now()
+const pendingLockReleases = new Map<string, () => Promise<void>>()
+
+async function retryLockOperation<T>(operation: () => Promise<T>, acquisitionDeadline = Infinity) {
+  const deadline = Math.min(acquisitionDeadline, Date.now() + TRANSIENT_LOCK_BUDGET_MS)
   for (;;) {
     try {
-      await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
-      break
+      return await operation()
     } catch (error) {
-      if (!isTransientLockError(error) || Date.now() - startedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
+      if (!isTransientLockError(error) || Date.now() >= deadline) throw error
       await sleep(LOCK_RETRY_MS)
     }
   }
+}
+
+function processLockRelease(lock: string, ownerPath: string, token: string) {
+  let running: Promise<void> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const finish = () => {
+    running ??= (async () => {
+      await retryLockOperation(async () => {
+        const current = await readFile(lock, "utf8").catch((error: unknown) => {
+          if (isMissingStateFile(error)) return null
+          throw error
+        })
+        if (current === token) await rm(lock, { force: true })
+      })
+      if (pendingLockReleases.get(lock) === finish) pendingLockReleases.delete(lock)
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      await rm(ownerPath, { force: true }).catch(() => undefined)
+    })().finally(() => { running = undefined })
+    return running
+  }
+  const release = async () => {
+    try {
+      await finish()
+    } catch (error) {
+      // Keep the exact token available for recovery even while this pid lives.
+      pendingLockReleases.set(lock, finish)
+      if (isTransientLockError(error) && !timer) {
+        timer = setTimeout(() => { timer = undefined; void release() }, 1000)
+        timer.unref?.()
+      }
+    }
+  }
+  return release
+}
+
+async function acquireProcessLock(lock: string, deadline: number): Promise<() => Promise<void>> {
+  await pendingLockReleases.get(lock)?.()
+  const token = `${process.pid}-${randomUUID()}`
+  const ownerPath = `${lock}.owner.${token}`
   let acquired = false
   try {
+    await retryLockOperation(async () => {
+      // A failed create may leave a partial file at this attempt's unique path.
+      await rm(ownerPath, { force: true })
+      await writeFile(ownerPath, token, { mode: 0o600, flag: "wx" })
+    }, deadline)
     for (;;) {
+      if (Date.now() >= deadline) throw new Error("timed out waiting for the loop state lock")
       try {
         // Publish the complete identity atomically without requiring symlink privileges.
-        await link(ownerPath, lock)
+        await retryLockOperation(() => link(ownerPath, lock), deadline)
         acquired = true
-        return async () => {
-          // Best-effort: a release failure must never turn a successful
-          // mutation into a user-visible error. An unreleased lock recovers
-          // via the dead-pid check in the contention path below.
-          try {
-            let current: string | null = null
-            try {
-              current = await readFile(lock, "utf8")
-            } catch (error) {
-              if (!isMissingStateFile(error) && !isTransientLockError(error)) throw error
-            }
-            if (current === token) {
-              const releasedAt = Date.now()
-              for (;;) {
-                try {
-                  await rm(lock, { force: true })
-                  break
-                } catch (error) {
-                  if (!isTransientLockError(error) || Date.now() - releasedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
-                  await sleep(LOCK_RETRY_MS)
-                }
-              }
-            }
-          } catch {
-            // Ignore: the next contender reclaims a stale lock by pid.
-          } finally {
-            await rm(ownerPath, { force: true }).catch(() => undefined)
-          }
-        }
+        return processLockRelease(lock, ownerPath, token)
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-          // On Windows, linking onto a path whose deletion is still pending
-          // surfaces as EPERM/EACCES rather than EEXIST. Treat it as a
-          // mid-handoff retry instead of a fatal error.
-          if (!isTransientLockError(error) || Date.now() - startedAt >= TRANSIENT_LOCK_BUDGET_MS) throw error
-          await sleep(LOCK_RETRY_MS)
-          continue
-        }
+        if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error
         try {
-          const owner = await readFile(lock, "utf8")
+          const owner = await retryLockOperation(() => readFile(lock, "utf8"), deadline)
           const pid = Number(owner.split("-", 1)[0])
           if (/^\d+-[0-9a-f-]{36}$/.test(owner) && !processIsAlive(pid)) {
-            // Recover the guard by the same protocol if a previous reclaimer died.
             const release = await acquireProcessLock(`${lock}.reclaim.${owner}`, deadline)
             try {
-              if (await readFile(lock, "utf8").catch(() => null) === owner) {
-                await rm(lock, { force: true })
-                await rm(`${lock}.owner.${owner}`, { force: true })
-              }
+              await retryLockOperation(async () => {
+                if (await readFile(lock, "utf8") === owner) {
+                  await rm(lock, { force: true })
+                  await rm(`${lock}.owner.${owner}`, { force: true })
+                }
+              }, deadline)
             } finally {
               await release()
             }
           }
         } catch (lockError) {
-          if (!isMissingStateFile(lockError) && !isTransientLockError(lockError)) throw lockError
+          if (!isMissingStateFile(lockError)) throw lockError
         }
         if (Date.now() >= deadline) throw new Error("timed out waiting for the loop state lock", { cause: error })
         await sleep(LOCK_RETRY_MS)
