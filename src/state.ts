@@ -724,7 +724,7 @@ export async function stopLoopIfUnchanged(
 ) {
   return mutate((state) => {
     const loop = state.loops[loopID]
-    if (!loop || (sessionLease && !matchesSessionLease(state, sessionLease))) return null
+    if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
     if (
       loop.updatedAt !== expectedUpdatedAt ||
       loop.status !== "active" ||
@@ -735,6 +735,35 @@ export async function stopLoopIfUnchanged(
     }
     loop.status = "stopped"
     loop.stopReason = reason.trim().slice(0, 400) || "stopped"
+    loop.updatedAt = now()
+    return snapshot(loop)
+  })
+}
+
+export async function rescheduleDynamicIfUnchanged(
+  loopID: string,
+  expectedUpdatedAt: number,
+  delayMs: number,
+  reason: string,
+  sessionLease?: SessionLease,
+) {
+  const delay = positiveIntegerOrNull(Math.round(delayMs))
+  if (delay == null) throw new Error("delay must be a positive number of milliseconds")
+  return mutate((state) => {
+    const loop = state.loops[loopID]
+    if (!loop || (sessionLease && (sessionLease.sessionID !== loop.sessionID || !matchesSessionLease(state, sessionLease)))) return null
+    if (
+      loop.updatedAt !== expectedUpdatedAt ||
+      loop.status !== "active" ||
+      loop.mode !== "dynamic" ||
+      loop.nextRunAt != null
+    ) {
+      return null
+    }
+    loop.scheduleRevision += 1
+    loop.nextRunAt = now() + delay
+    loop.nextRetryAt = null
+    loop.lastReason = reason.trim().slice(0, 400) || loop.lastReason
     loop.updatedAt = now()
     return snapshot(loop)
   })

@@ -23,6 +23,7 @@ import {
   recordRunSentClaimed,
   recordRunFailedClaimed,
   recordRunDeferredClaimed,
+  rescheduleDynamicIfUnchanged,
   stopLoopClaimed,
   recordRunFailed,
   recordRunSent,
@@ -171,6 +172,21 @@ test("conditional dynamic cleanup ignores missing and changed loops", async () =
   await scheduleNextRun(scheduled.id, 60_000, "still owned")
   expect(await stopLoopIfUnchanged(scheduled.id, scheduled.updatedAt, "stale after restart")).toBeNull()
   expect((await getLoop(scheduled.id))?.status).toBe("active")
+})
+
+test("stale dynamic loops resume with fallback delay instead of stopping", async () => {
+  const created = await createLoop("ses_1", { prompt: "watch CI", mode: "dynamic" })
+  const resumed = await rescheduleDynamicIfUnchanged(created.id, created.updatedAt, 120_000, "restart fallback")
+  expect(resumed?.nextRunAt).toBeGreaterThan(Date.now())
+  expect(resumed?.status).toBe("active")
+  expect(resumed?.lastReason).toBe("restart fallback")
+
+  const changed = (await getLoop(created.id))!
+  expect(await rescheduleDynamicIfUnchanged(created.id, created.updatedAt, 120_000, "stale")).toBeNull()
+  const after = await getLoop(created.id)
+  expect(after?.nextRunAt).toBe(changed.nextRunAt)
+  expect(after?.updatedAt).toBe(changed.updatedAt)
+  expect(after?.scheduleRevision).toBe(changed.scheduleRevision)
 })
 
 test("serializes state mutations across processes", async () => {
@@ -400,7 +416,12 @@ test("orphan dynamic cleanup is fenced by session ownership", async () => {
   await releaseSessionLease("ses_1", "a", lease.revision)
   await acquireSessionLease("ses_1", "b", 60_000)
   expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "stale", lease)).toBeNull()
+  expect(await rescheduleDynamicIfUnchanged(loop.id, loop.updatedAt, 60_000, "restart", lease)).toBeNull()
+  const foreign = (await acquireSessionLease("ses_other", "a", 60_000))!
+  expect(await stopLoopIfUnchanged(loop.id, loop.updatedAt, "stale", foreign)).toBeNull()
+  expect(await rescheduleDynamicIfUnchanged(loop.id, loop.updatedAt, 60_000, "restart", foreign)).toBeNull()
   expect((await getLoop(loop.id))?.status).toBe("active")
+  expect((await getLoop(loop.id))?.nextRunAt).toBeNull()
 })
 
 test("maximum failure backoff caps even the first retry", async () => {

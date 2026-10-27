@@ -291,6 +291,26 @@ test("system transform merges a loop reminder for sessions with open loops", asy
   await hooks.dispose?.()
 })
 
+test.each(["fallback", "stop"])("V1 recovers stale dynamic loops in %s mode", async (mode) => {
+  const loop = await createLoop("ses_1", { prompt: "watch CI", mode: "dynamic" })
+  const hooks = await makeServer([], { dynamic_restart_mode: mode, dynamic_restart_fallback_seconds: 120 })
+  try {
+    expect((await getLoop(loop.id))?.nextRunAt).toBeNull()
+    const started = Date.now()
+    await idle(hooks, "ses_1")
+    const recovered = await getLoop(loop.id)
+    if (mode === "stop") expect(recovered?.status).toBe("stopped")
+    else {
+      expect(recovered?.status).toBe("active")
+      expect(recovered?.nextRunAt).toBeGreaterThanOrEqual(started + 120000)
+      await idle(hooks, "ses_1")
+      expect((await getLoop(loop.id))?.nextRunAt).toBe(recovered?.nextRunAt)
+    }
+  } finally {
+    await hooks.dispose?.()
+  }
+})
+
 test("rehydrated loops resume after an authoritative idle event", async () => {
   const sent: SentPrompt[] = []
   const first = await makeServer(sent)

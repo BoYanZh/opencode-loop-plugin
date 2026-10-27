@@ -342,6 +342,58 @@ test("V2 context hook injects a session-specific loop reminder", async () => {
   await cleanup()
 })
 
+test("V2 compaction preserves open loops per session without duplicating context", async () => {
+  const mock = makeMockContext()
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    await loopTool(mock, "create_loop").execute({ instruction: "preserve this task", interval: "1m" }, toolContext())
+    const compaction = mock.hooks.compaction
+    if (!compaction) throw new Error("compaction hook not registered")
+    const input = { sessionID: "ses_v2", system: [{ type: "text", text: "OpenCode loop mode reminder: existing per-turn context" }] }
+    await compaction(input)
+    await compaction(input)
+    expect(input.system).toHaveLength(2)
+    expect(input.system[1]?.text).toContain("preserve this task")
+    expect(input.system[1]?.text).toContain("across compaction")
+    const other = { sessionID: "ses_other", system: [] }
+    await compaction(other)
+    expect(other.system).toHaveLength(0)
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
+test.each([
+  { mode: "fallback", fallback: 0.1, maximum: 60, delay: 1000 },
+  { mode: "fallback", fallback: 1200, maximum: 2, delay: 2000 },
+  { mode: "fallback", fallback: undefined, maximum: 86400, delay: 1200000 },
+  { mode: "stop", fallback: 1, maximum: 60, delay: null },
+])("V2 recovers stale dynamic loops using restart options %j", async ({ mode, fallback, maximum, delay }) => {
+  const loop = await createLoop("ses_v2", { prompt: "watch CI", mode: "dynamic" })
+  const mock = makeMockContext({ dynamic_restart_mode: mode, dynamic_restart_fallback_seconds: fallback, dynamic_max_delay_seconds: maximum })
+  const cleanup = await plugin.setup(mock as never)
+  try {
+    expect((await getLoop(loop.id))?.nextRunAt).toBeNull()
+    const started = Date.now()
+    await mock.hooks.context?.({ sessionID: "ses_v2", system: [] })
+    const recovered = await getLoop(loop.id)
+    if (delay === null) {
+      expect(recovered?.status).toBe("stopped")
+      expect(recovered?.stopReason).toContain("restarted")
+    } else {
+      expect(recovered?.status).toBe("active")
+      expect(recovered?.nextRunAt).toBeGreaterThanOrEqual(started + delay)
+      expect(recovered?.nextRunAt).toBeLessThanOrEqual(Date.now() + delay)
+      await mock.hooks.context?.({ sessionID: "ses_v2", system: [] })
+      expect((await getLoop(loop.id))?.nextRunAt).toBe(recovered?.nextRunAt)
+    }
+  } finally {
+    mock.stream.end()
+    await cleanup()
+  }
+})
+
 test("V2 busy/idle events defer and then inject loop iterations", async () => {
   const mock = makeMockContext()
   const cleanup = await plugin.setup(mock as never)
